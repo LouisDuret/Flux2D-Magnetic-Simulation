@@ -1,7 +1,10 @@
 //! Application : état de l'éditeur, panneaux et canevas.
 
-use crate::render::{FLAG_LINES, FLAG_MAP, FLAG_SRGB, FieldCallback, FieldRenderer, Uniforms};
+use crate::render::{
+    FLAG_ANIMATE, FLAG_DIFF, FLAG_FILINGS, FLAG_LIC, FLAG_LINES, FLAG_MAP, FLAG_SPLIT, FLAG_SRGB, FieldCallback, FieldRenderer, Uniforms,
+};
 use crate::theme;
+use crate::visuals::Visuals;
 use eframe::egui::{self, Align2, Color32, FontId, Key, Modifiers, PointerButton, Pos2, Rect, Sense, Stroke, vec2};
 use eframe::egui_wgpu;
 use flux_core::material::MagClass;
@@ -21,9 +24,11 @@ enum Tool {
     Coil,
     Probe,
     Cut,
+    Seed,
+    Sprinkle,
 }
 
-const TOOLS: [(Tool, &str, Key, &str); 7] = [
+const TOOLS: [(Tool, &str, Key, &str); 9] = [
     (Tool::Select, "Sélection", Key::V, "Sélectionner et déplacer (V)"),
     (Tool::Rect, "Rectangle", Key::R, "Dessiner un bloc du matériau courant (R)"),
     (Tool::Circle, "Disque", Key::E, "Dessiner un disque du matériau courant (E)"),
@@ -31,6 +36,8 @@ const TOOLS: [(Tool, &str, Key, &str); 7] = [
     (Tool::Coil, "Bobine", Key::C, "Glisser : bobine (aller + retour) · clic : fil (C)"),
     (Tool::Probe, "Sonde", Key::H, "Épingler une sonde (H)"),
     (Tool::Cut, "Coupe", Key::L, "Tracer une ligne de coupe (L)"),
+    (Tool::Seed, "Graine", Key::G, "Tracer la ligne de champ passant par un point (G)"),
+    (Tool::Sprinkle, "Limaille", Key::S, "Saupoudrer de la limaille de fer (S)"),
 ];
 
 enum Drag {
@@ -38,23 +45,39 @@ enum Drag {
     Create(DVec2),
     Cut(DVec2),
     Pan,
+    Sprinkle,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Compare {
+    Off,
+    Split,
+    Diff,
+}
+
+/// État figé auquel le champ courant est comparé.
+struct Reference {
+    n: usize,
+    size: f64,
+    scene: Scene,
 }
 
 /// Transformation monde (m, y vers le haut) ↔ écran (points, y vers le bas).
 #[derive(Clone, Copy)]
-struct View {
-    center: DVec2,
-    scale: f64,
-    rect: Rect,
+pub(crate) struct View {
+    pub center: DVec2,
+    /// Mètres par point d'écran.
+    pub scale: f64,
+    pub rect: Rect,
 }
 
 impl View {
-    fn to_world(self, p: Pos2) -> DVec2 {
+    pub fn to_world(self, p: Pos2) -> DVec2 {
         let d = p - self.rect.center();
         self.center + DVec2::new(d.x as f64, -d.y as f64) * self.scale
     }
 
-    fn to_screen(self, w: DVec2) -> Pos2 {
+    pub fn to_screen(self, w: DVec2) -> Pos2 {
         let d = (w - self.center) / self.scale;
         self.rect.center() + vec2(d.x as f32, -d.y as f32)
     }
@@ -96,6 +119,18 @@ pub struct App {
     show_lines: bool,
     show_map: bool,
     show_vectors: bool,
+    show_lic: bool,
+    lic_animate: bool,
+    show_filings: bool,
+    show_compass: bool,
+    show_particles: bool,
+    visuals: Visuals,
+    /// Incrémenté à chaque nouveau champ calculé.
+    field_version: u64,
+    reference: Option<Reference>,
+    compare: Compare,
+    /// Position de la séparation avant/après, en fraction de la largeur du canevas.
+    split: f32,
     n_lines: f64,
     show_ui: bool,
 }
@@ -151,8 +186,15 @@ impl App {
             solver = Box::new(Planar2DGpu::new(rs.device.clone(), rs.queue.clone()));
             use_gpu = true;
         }
-        // Une scène passée en argument s'ouvre au démarrage.
-        let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+        // Arguments : une scène à ouvrir, et `--modes=125` pour choisir les modes affichés au démarrage.
+        let (mut path, mut modes) = (None, None);
+        for arg in std::env::args_os().skip(1) {
+            match arg.to_string_lossy().strip_prefix("--modes=") {
+                Some(m) => modes = Some(m.to_owned()),
+                None => path = Some(std::path::PathBuf::from(arg)),
+            }
+        }
+        let mode = |digit: char, default: bool| modes.as_ref().map_or(default, |m| m.contains(digit));
         let scene = path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| Scene::from_ron(&s).ok());
         App {
             path: path.filter(|_| scene.is_some()),
@@ -183,9 +225,19 @@ impl App {
             lib_material: "Acier doux (S235)".into(),
             lib_filter: None,
             search: String::new(),
-            show_lines: true,
-            show_map: true,
-            show_vectors: false,
+            show_lines: mode('1', true),
+            show_map: mode('2', true),
+            show_vectors: mode('3', false),
+            show_lic: mode('4', false),
+            lic_animate: true,
+            show_filings: mode('5', false),
+            show_compass: mode('6', false),
+            show_particles: mode('7', false),
+            visuals: Visuals::default(),
+            field_version: 0,
+            reference: None,
+            compare: Compare::Off,
+            split: 0.5,
             n_lines: 48.0,
             show_ui: true,
         }
@@ -212,6 +264,7 @@ impl App {
         if self.pending {
             self.status = self.solver.solve(Duration::from_millis(if self.use_gpu { 6 } else { 12 }));
             self.stats_stale = true;
+            self.field_version += 1;
             let field = self.solver.field();
             if let Some(rs) = &self.render_state
                 && let Some(r) = rs.renderer.write().callback_resources.get_mut::<FieldRenderer>()
@@ -232,6 +285,20 @@ impl App {
             self.a_span = (hi - lo).max(0.0);
             self.b_max = field.b_max().max(1e-9);
             self.stats_stale = false;
+        }
+    }
+
+    /// Fige le champ et la scène actuels comme référence de la comparaison avant/après.
+    fn freeze_reference(&mut self) {
+        let field = self.solver.field();
+        if let Some(rs) = &self.render_state
+            && let Some(r) = rs.renderer.write().callback_resources.get_mut::<FieldRenderer>()
+        {
+            r.set_reference(&rs.device, &rs.queue, Some(&field.a));
+        }
+        self.reference = Some(Reference { n: field.n, size: field.size, scene: self.scene.clone() });
+        if self.compare == Compare::Off {
+            self.compare = Compare::Split;
         }
     }
 
@@ -385,7 +452,15 @@ impl App {
                     self.tool = tool;
                 }
             }
-            for (key, flag) in [(Key::Num1, &mut self.show_lines), (Key::Num2, &mut self.show_map), (Key::Num3, &mut self.show_vectors)] {
+            for (key, flag) in [
+                (Key::Num1, &mut self.show_lines),
+                (Key::Num2, &mut self.show_map),
+                (Key::Num3, &mut self.show_vectors),
+                (Key::Num4, &mut self.show_lic),
+                (Key::Num5, &mut self.show_filings),
+                (Key::Num6, &mut self.show_compass),
+                (Key::Num7, &mut self.show_particles),
+            ] {
                 if i.key_pressed(key) {
                     *flag = !*flag;
                 }
@@ -442,6 +517,10 @@ impl App {
             ui.toggle_value(&mut self.show_lines, "1 Lignes");
             ui.toggle_value(&mut self.show_map, "2 Carte");
             ui.toggle_value(&mut self.show_vectors, "3 Vecteurs");
+            ui.toggle_value(&mut self.show_lic, "4 LIC").on_hover_text("Convolution intégrale linéaire : texture du flux");
+            ui.toggle_value(&mut self.show_filings, "5 Limaille");
+            ui.toggle_value(&mut self.show_compass, "6 Boussoles");
+            ui.toggle_value(&mut self.show_particles, "7 Particules");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.colored_label(theme::ACCENT, format!("2D plan · profondeur {:.0} mm", self.scene.depth * 1e3))
                     .on_hover_text("Objets extrudés à l'infini selon z : les forces sont calculées par mètre de profondeur.");
@@ -579,6 +658,30 @@ impl App {
             });
             ui.label(format!("Pas : {:.3} mm", self.scene.size / self.grid_n as f64 * 1e3));
             ui.add(egui::Slider::new(&mut self.n_lines, 8.0..=160.0).text("lignes"));
+            ui.separator();
+            ui.strong("Affichage");
+            ui.checkbox(&mut self.lic_animate, "Animer la LIC");
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(!self.scene.seeds.is_empty(), egui::Button::new("Effacer les graines")).clicked() {
+                    self.scene.seeds.clear();
+                }
+                if ui.add_enabled(!self.visuals.filings.is_empty(), egui::Button::new("Balayer la limaille")).clicked() {
+                    self.visuals.filings.clear();
+                }
+            });
+            ui.separator();
+            ui.strong("Comparaison");
+            if ui.button("Figer l'état actuel comme référence").clicked() {
+                self.freeze_reference();
+            }
+            ui.add_enabled_ui(self.reference.is_some(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.compare, Compare::Off, "Aucune");
+                    ui.selectable_value(&mut self.compare, Compare::Split, "Avant | après");
+                    ui.selectable_value(&mut self.compare, Compare::Diff, "Différence");
+                });
+                ui.add(egui::Slider::new(&mut self.split, 0.05..=0.95).text("séparation").show_value(false));
+            });
             ui.separator();
             ui.weak("Sélectionnez un objet pour l'inspecter, ou choisissez un outil et dessinez sur le canevas.");
             return;
@@ -778,7 +881,8 @@ impl App {
                     }
                     None => Drag::Pan,
                 },
-                Tool::Probe => Drag::Pan,
+                Tool::Probe | Tool::Seed => Drag::Pan,
+                Tool::Sprinkle => Drag::Sprinkle,
                 Tool::Cut => Drag::Cut(start),
                 _ => Drag::Create(start),
             });
@@ -799,6 +903,7 @@ impl App {
                     }
                 }
                 Some(Drag::Cut(start)) => self.scene.cut_line = Some([start.extend(0.0), cur.extend(0.0)]),
+                Some(Drag::Sprinkle) => self.visuals.sprinkle(cur, 18.0 * view.scale, self.solver.field(), self.b_max),
                 _ => {}
             }
         }
@@ -812,6 +917,8 @@ impl App {
             match self.tool {
                 Tool::Select => self.selected = self.scene.pick(cur.extend(0.0)),
                 Tool::Probe => self.scene.probes.push(cur.extend(0.0)),
+                Tool::Seed => self.scene.seeds.push(cur.extend(0.0)),
+                Tool::Sprinkle => self.visuals.sprinkle(cur, 18.0 * view.scale, self.solver.field(), self.b_max),
                 Tool::Cut => {}
                 _ => self.create(cur, cur),
             }
@@ -821,9 +928,14 @@ impl App {
         // Champ : rendu GPU derrière les objets.
         let field = self.solver.field();
         let lines = self.show_lines && self.a_span > 0.0;
+        // La comparaison n'a de sens que sur la même grille que la référence.
+        let compare =
+            if self.reference.as_ref().is_some_and(|r| r.n == field.n && r.size == field.size) { self.compare } else { Compare::Off };
+        let split_x = (compare == Compare::Split).then(|| resp.rect.left() + self.split * resp.rect.width());
         if self.render_state.is_some() {
             let srgb = self.render_state.as_ref().is_some_and(|rs| rs.target_format.is_srgb());
             let half = resp.rect.size() * 0.5 * view.scale as f32;
+            let px = view.scale as f32 / ui.ctx().pixels_per_point();
             painter.add(egui_wgpu::Callback::new_paint_callback(
                 resp.rect,
                 FieldCallback(Uniforms {
@@ -833,8 +945,21 @@ impl App {
                     n: field.n as u32,
                     delta_a: (self.a_span / self.n_lines) as f32,
                     b_max: self.b_max as f32,
-                    flags: (lines as u32 * FLAG_LINES) | (self.show_map as u32 * FLAG_MAP) | (srgb as u32 * FLAG_SRGB),
+                    flags: (lines as u32 * FLAG_LINES)
+                        | (self.show_map as u32 * FLAG_MAP)
+                        | (srgb as u32 * FLAG_SRGB)
+                        | (self.show_lic as u32 * FLAG_LIC)
+                        | (self.lic_animate as u32 * FLAG_ANIMATE)
+                        | (self.show_filings as u32 * FLAG_FILINGS)
+                        | (split_x.is_some() as u32 * FLAG_SPLIT)
+                        | ((compare == Compare::Diff) as u32 * FLAG_DIFF),
                     line_px: 0.9 * ui.ctx().pixels_per_point(),
+                    px,
+                    time: (ui.input(|i| i.time) * 0.7).fract() as f32,
+                    // Maille de la limaille : environ 7 pixels, arrondie à une puissance de deux
+                    // pour que les grains restent en place quand la vue se déplace.
+                    grain: (7.0 * px).log2().round().exp2(),
+                    split: split_x.map_or(0.0, |x| view.to_world(egui::pos2(x, 0.0)).x as f32),
                     pad: [0.0; 2],
                 }),
             ));
@@ -857,8 +982,41 @@ impl App {
             }
         }
 
-        for o in &self.scene.objects {
-            self.draw_object(&painter, view, o);
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        let mut animating = self.show_lic && self.lic_animate && self.render_state.is_some();
+        if self.show_particles {
+            self.visuals.particles(&painter, view, field, self.b_max, dt);
+            animating = true;
+        }
+        self.visuals.draw_filings(&painter, view, field);
+        if self.show_compass {
+            animating |= self.visuals.compasses(&painter, view, field, self.b_max, dt);
+        }
+        self.visuals.seed_lines(&painter, view, field, &self.scene.seeds, self.field_version);
+        if animating {
+            ui.ctx().request_repaint();
+        }
+
+        match (&self.reference, split_x) {
+            // Vue scindée : objets de référence à gauche de la séparation, objets courants à droite.
+            (Some(reference), Some(x)) => {
+                let (left, right) = resp.rect.split_left_right_at_x(x);
+                for o in &reference.scene.objects {
+                    self.draw_object(&painter.with_clip_rect(left), view, o);
+                }
+                for o in &self.scene.objects {
+                    self.draw_object(&painter.with_clip_rect(right), view, o);
+                }
+                painter.vline(x, resp.rect.y_range(), Stroke::new(1.0, theme::ACCENT));
+                let y = resp.rect.top() + 8.0;
+                painter.text(egui::pos2(x - 8.0, y), Align2::RIGHT_TOP, "avant", FontId::proportional(12.0), theme::ACCENT);
+                painter.text(egui::pos2(x + 8.0, y), Align2::LEFT_TOP, "après", FontId::proportional(12.0), theme::ACCENT);
+            }
+            _ => {
+                for o in &self.scene.objects {
+                    self.draw_object(&painter, view, o);
+                }
+            }
         }
         let f_max = self.wrenches.iter().map(|w| w.force.length()).fold(1e-12, f64::max);
         for w in &self.wrenches {

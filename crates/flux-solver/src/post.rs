@@ -166,3 +166,40 @@ pub fn forces(field: &Field, scene: &Scene) -> Vec<Wrench> {
     }
     out
 }
+
+impl Field {
+    /// Ligne de champ passant par `seed`, intégrée par Runge–Kutta 4 dans les deux sens
+    /// jusqu'au bord du domaine, à un point de champ nul ou à la fermeture de la boucle.
+    pub fn trace(&self, seed: DVec3) -> Vec<DVec3> {
+        let step = 0.5 * self.h();
+        let dir = |p: DVec3| self.sample(p).map(|s| s.b.normalize_or_zero()).filter(|d| *d != DVec3::ZERO);
+        let mut line = vec![seed];
+        for sign in [1.0, -1.0] {
+            let s = sign * step;
+            let mut p = seed;
+            let mut pts = Vec::new();
+            for k in 0..8 * self.n {
+                let Some(k1) = dir(p) else { break };
+                let Some(k2) = dir(p + k1 * (s / 2.0)) else { break };
+                let Some(k3) = dir(p + k2 * (s / 2.0)) else { break };
+                let Some(k4) = dir(p + k3 * s) else { break };
+                p += (k1 + 2.0 * k2 + 2.0 * k3 + k4) * (s / 6.0);
+                pts.push(p);
+                if k > 8 && p.distance(seed) < step {
+                    // Boucle fermée : inutile d'intégrer dans l'autre sens.
+                    line.extend(pts);
+                    line.push(seed);
+                    return line;
+                }
+            }
+            if sign > 0.0 {
+                line.extend(pts);
+            } else {
+                pts.reverse();
+                pts.extend(line);
+                line = pts;
+            }
+        }
+        line
+    }
+}

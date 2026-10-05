@@ -66,6 +66,9 @@ pub struct Scene {
     pub materials: Vec<Material>,
     #[serde(default)]
     pub probes: Vec<DVec3>,
+    /// Graines des lignes de champ tracées par intégration.
+    #[serde(default)]
+    pub seeds: Vec<DVec3>,
     #[serde(default)]
     pub cut_line: Option<[DVec3; 2]>,
     next_id: u32,
@@ -82,6 +85,7 @@ impl Default for Scene {
             objects: Vec::new(),
             materials: library(),
             probes: Vec::new(),
+            seeds: Vec::new(),
             cut_line: None,
             next_id: 1,
         }

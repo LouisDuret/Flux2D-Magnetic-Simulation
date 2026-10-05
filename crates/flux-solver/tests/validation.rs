@@ -191,3 +191,21 @@ fn superconductor_expels_field() {
         solve(&mut gpu, &scene, 1024);
     }
 }
+
+/// Une ligne de champ tracée autour d'un fil est un cercle qui se referme.
+#[test]
+fn traced_line_around_wire_is_a_circle() {
+    let mut scene = Scene::default();
+    scene.size = 0.2;
+    wire(&mut scene, 0.0, 10.0);
+    let mut cpu = Cpu64Reference::default();
+    solve(&mut cpu, &scene, 256);
+    let seed = DVec3::new(0.02, 0.0, 0.0);
+    let line = cpu.field().trace(seed);
+    assert_eq!(line.last(), Some(&seed), "la ligne doit se refermer");
+    let length: f64 = line.windows(2).map(|w| w[0].distance(w[1])).sum();
+    assert_close(length, 2.0 * PI * 0.02, 0.005, "longueur de la ligne");
+    for p in &line {
+        assert!((p.length() - 0.02).abs() < 0.005 * 0.02, "rayon {}", p.length());
+    }
+}

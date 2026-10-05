@@ -22,7 +22,8 @@ cargo test --release --workspace
 ## Raccourcis
 
 `V` sélection · `R` rectangle · `E` disque · `M` aimant · `C` bobine (clic : fil) · `H` sonde · `L` ligne de coupe
-`1` lignes · `2` carte · `3` vecteurs · `F` cadrer · `Tab` masquer l'interface · `Suppr` supprimer
+`G` graine d'une ligne de champ · `S` saupoudrer de la limaille
+`1` lignes · `2` carte · `3` vecteurs · `4` LIC · `5` limaille · `6` boussoles · `7` particules · `F` cadrer · `Tab` masquer l'interface · `Suppr` supprimer
 `Ctrl Z` / `Ctrl Maj Z` annuler / rétablir · `Ctrl D` ou `Alt`+glisser dupliquer · `Ctrl S` enregistrer
 Molette : zoom · clic milieu ou glisser dans le vide : déplacer la vue
 
@@ -35,4 +36,6 @@ Molette : zoom · clic milieu ou glisser dans le vide : déplacer la vue
 
 Para- et diamagnétiques ne dévient pas visiblement les lignes de champ (effet de l'ordre de χ/2, soit 0,01 % pour le bismuth) : le solveur les traite comme le vide et calcule leur force par la densité de Kelvin. Seul un supraconducteur refroidi sous Tc (χ = −1) expulse le champ.
 
-Une scène peut être passée en argument : `cargo run --release -p flux-app -- examples/supraconducteur.flux`.
+Une scène peut être passée en argument : `cargo run --release -p flux-app -- examples/supraconducteur.flux`. L'option `--modes=1245` choisit les modes de visualisation actifs au démarrage.
+
+La comparaison avant/après (vue scindée ou carte de différence) se règle dans le panneau de droite, sans objet sélectionné : « Figer l'état actuel comme référence ».
