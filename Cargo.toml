@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/flux-core", "crates/flux-solver", "crates/flux-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+flux-core = { path = "crates/flux-core" }
+flux-solver = { path = "crates/flux-solver" }
+glam = { version = "0.32", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+rayon = "1"
+bytemuck = { version = "1", features = ["derive"] }
+wgpu = "30"
+pollster = "0.4"
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
+rfd = "0.17"
+
+# Le calcul numérique est inutilisable sans optimisation, même en debug.
+[profile.dev]
+opt-level = 2
+debug = "line-tables-only"
+# Sans infos de débogage pour les dépendances : sinon le PDB dépasse la limite
+# de link.exe (LNK1140) sous Windows.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false

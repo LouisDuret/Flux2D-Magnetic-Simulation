@@ -1,0 +1,17 @@
+[package]
+name = "flux-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flux2d"
+path = "src/main.rs"
+
+[dependencies]
+flux-core.workspace = true
+flux-solver.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+eframe.workspace = true
+rfd.workspace = true
