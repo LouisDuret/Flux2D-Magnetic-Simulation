@@ -145,7 +145,7 @@ fn magma(t: f32) -> vec3<f32> {
 
 @fragment
 fn fs(in: VOut) -> @location(0) vec4<f32> {
-    let bg = vec3<f32>(0.055, 0.067, 0.086);
+    let bg = vec3<f32>(0.039, 0.043, 0.051);
     let g_raw = (in.world + 0.5 * u.size) / u.size;
     let inside = all(g_raw >= vec2<f32>(0.0)) && all(g_raw <= vec2<f32>(1.0));
     let s = sample_shown(in.world);

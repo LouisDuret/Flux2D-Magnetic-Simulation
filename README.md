@@ -17,7 +17,13 @@ cargo test --release --workspace
 |---|---|
 | `flux-core` | Matériaux, formes (SDF), scène RON (`.flux`), rastérisation. Sans fenêtre ni GPU. |
 | `flux-solver` | Trait `FieldSolver`, MG-PCG `Planar2DGpu` (compute wgpu, f32) et `Cpu64Reference` (f64), forces par tenseur de Maxwell pondéré. |
-| `flux-app` | Application `flux2d` : eframe (winit + egui + wgpu), thème sombre, canevas. |
+| `flux-app` | Application `flux2d` : eframe (winit + egui + wgpu), thème « instrument », canevas. |
+
+## Interface
+
+L'interface suit la maquette « style instrument » (maquette HTML de référence, non versionnée) : thème dans `crates/flux-app/src/theme.rs`, widgets dans `ui.rs`, panneaux et canevas dans `app/`.
+
+Polices : IBM Plex Sans et IBM Plex Mono sont utilisées si les fichiers `IBMPlexSans-Regular.ttf`, `IBMPlexSans-SemiBold.ttf`, `IBMPlexMono-Regular.ttf` et `IBMPlexMono-SemiBold.ttf` sont placés dans `assets/fonts/` ; sinon l'application se rabat sur Segoe UI et Consolas.
 
 ## Raccourcis
 

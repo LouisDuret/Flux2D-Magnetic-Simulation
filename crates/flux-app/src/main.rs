@@ -4,6 +4,7 @@
 mod app;
 mod render;
 mod theme;
+mod ui;
 mod visuals;
 
 use eframe::egui;
