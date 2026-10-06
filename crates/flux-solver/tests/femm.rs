@@ -34,11 +34,9 @@ fn scenes() -> Vec<(&'static str, Scene)> {
     let mut lifter = Scene::default();
     lifter.name = "Électroaimant".into();
     lifter.add("Noyau", Shape::Rect { w: 0.02, h: 0.04 }, DVec2::ZERO, "Acier doux (S235)");
-    for (x, amps) in [(-0.015, 4.0), (0.015, -4.0)] {
-        let id = lifter.add("Bobine", Shape::Rect { w: 0.008, h: 0.036 }, DVec2::new(x, 0.0), "Cuivre (bobinage)");
-        let o = lifter.get_mut(id).unwrap();
-        (o.turns, o.current, o.fill) = (300.0, amps, 0.6);
-    }
+    let coil = lifter.add("Bobine", Shape::Coil { w: 0.038, h: 0.036, thick: 0.008 }, DVec2::ZERO, "Cuivre (bobinage)");
+    let o = lifter.get_mut(coil).unwrap();
+    (o.turns, o.current, o.fill) = (300.0, -4.0, 0.6);
     lifter.add("Armature", Shape::Rect { w: 0.05, h: 0.01 }, DVec2::new(0.0, 0.028), "Acier doux (S235)");
     lifter.probes = vec![DVec3::new(0.0, 0.0215, 0.0), DVec3::new(0.03, 0.0, 0.0), DVec3::new(0.0, -0.03, 0.0)];
 

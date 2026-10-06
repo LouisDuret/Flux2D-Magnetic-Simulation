@@ -612,7 +612,7 @@ impl App {
         let o = self.scene.get(self.scene.pick(view.to_world(p).extend(0.0))?)?;
         let magnet = self.scene.material(&o.material).is_some_and(|m| m.class == MagClass::Magnet);
         let live = !magnet && !o.locked && o.amp_turns() != 0.0;
-        (live && p.distance(view.to_screen(o.pos.truncate())) <= GRAB).then_some(Hot::Current(o.id))
+        (live && o.conductors().iter().any(|(at, _)| p.distance(view.to_screen(*at)) <= GRAB)).then_some(Hot::Current(o.id))
     }
 
     fn draw_handles(&self, p: &Painter, h: Handles) {
@@ -677,7 +677,8 @@ impl App {
         let contours = o.world_contours();
         let Some(outer) = contours.first() else { return };
         let screen = |pts: &[DVec2]| -> Vec<Pos2> { pts.iter().map(|w| view.to_screen(*w)).collect() };
-        let bbox = Rect::from_points(&screen(outer));
+        // Tous les contours comptent : une bobine a deux sections disjointes.
+        let bbox = Rect::from_points(&screen(&contours.concat()));
         let magnet = mat.class == MagClass::Magnet;
 
         // Remplissage : la section est découpée en trapèzes, ce qui couvre les formes concaves ou trouées.
@@ -762,13 +763,17 @@ impl App {
             }
         } else if o.amp_turns() != 0.0 {
             // ⊙ courant sortant, ⊗ courant entrant ; un clic sur le symbole inverse le sens.
+            // Une bobine porte les deux, un par section.
             let s = Stroke::new(1.5, if self.hot == Some(Hot::Current(o.id)) { t::ACCENT } else { Color32::WHITE });
-            p.circle_stroke(c, 6.0, s);
-            if o.amp_turns() > 0.0 {
-                p.circle_filled(c, 1.8, s.color);
-            } else {
-                p.line_segment([c + vec2(-4.0, -4.0), c + vec2(4.0, 4.0)], s);
-                p.line_segment([c + vec2(-4.0, 4.0), c + vec2(4.0, -4.0)], s);
+            for (at, amps) in o.conductors() {
+                let c = view.to_screen(at);
+                p.circle_stroke(c, 6.0, s);
+                if amps > 0.0 {
+                    p.circle_filled(c, 1.8, s.color);
+                } else {
+                    p.line_segment([c + vec2(-4.0, -4.0), c + vec2(4.0, 4.0)], s);
+                    p.line_segment([c + vec2(-4.0, 4.0), c + vec2(4.0, -4.0)], s);
+                }
             }
         }
 

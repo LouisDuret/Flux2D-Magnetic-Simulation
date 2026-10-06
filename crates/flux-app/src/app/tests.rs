@@ -147,6 +147,46 @@ fn click_on_symbol_flips_current() {
     assert!((o.pos.truncate() - DVec2::new(0.002, 0.001)).length() < 1e-4);
 }
 
+/// L'outil bobine crée un seul objet à deux sections : il se sélectionne, se déplace et
+/// s'inverse d'un bloc, et l'espace entre ses sections reste libre.
+#[test]
+fn coil_tool_makes_a_single_object() {
+    let mut rig = Rig::new(Scene::default());
+    rig.app.tool = Tool::Coil;
+    rig.drag(rig.at(-20.0, -15.0), rig.at(20.0, 15.0));
+    assert_eq!(rig.app.scene.objects.len(), 1);
+    let coil = rig.app.scene.objects[0].clone();
+    let Shape::Coil { w, h, thick } = coil.shape else { panic!("forme = {:?}", coil.shape) };
+    assert!((w - 0.04).abs() < 1e-4 && (h - 0.03).abs() < 1e-4 && (thick - 0.008).abs() < 1e-4, "{w} × {h}, {thick}");
+    assert!(coil.pos.truncate().length() < 1e-4);
+    assert_eq!((rig.app.selected, coil.amp_turns()), (Some(coil.id), 100.0));
+    // Le courant sort à droite et rentre à gauche.
+    let marks = coil.conductors();
+    assert!((marks[0].0 - DVec2::new(0.016, 0.0)).length() < 1e-4 && (marks[1].0 - DVec2::new(-0.016, 0.0)).length() < 1e-4);
+    assert_eq!((marks[0].1, marks[1].1), (100.0, -100.0));
+
+    // Entre les deux sections, le clic ne touche rien ; sur une section, il sélectionne la bobine.
+    rig.idle(30);
+    rig.click(rig.at(0.0, 0.0));
+    assert_eq!(rig.app.selected, None);
+    rig.idle(30);
+    rig.click(rig.at(-16.0, 10.0));
+    assert_eq!((rig.app.selected, rig.app.scene.get(coil.id).unwrap().current), (Some(coil.id), 1.0));
+    // Un clic sur l'un ou l'autre symbole inverse le courant des deux sections.
+    rig.idle(30);
+    rig.click(rig.at(-16.0, 0.0) + vec2(2.0, 1.0));
+    assert_eq!(rig.app.scene.get(coil.id).unwrap().current, -1.0);
+    rig.idle(30);
+    rig.click(rig.at(16.0, 0.0));
+    assert_eq!(rig.app.scene.get(coil.id).unwrap().current, 1.0);
+    // Glissée par une section, la bobine se déplace tout entière.
+    rig.idle(30);
+    rig.drag(rig.at(16.0, 8.0), rig.at(21.0, 10.0));
+    let moved = rig.app.scene.get(coil.id).unwrap();
+    assert!((moved.pos.truncate() - DVec2::new(0.005, 0.002)).length() < 1e-4, "{:?}", moved.pos);
+    assert_eq!(rig.app.scene.pick(flux_core::DVec3::new(-0.011, 0.002, 0.0)), Some(coil.id));
+}
+
 #[test]
 fn material_dragged_from_library_onto_object() {
     let mut rig = demo();
@@ -431,6 +471,9 @@ fn english_interface_is_fully_translated() {
     let supra = scene.add("Disque", Shape::Circle { r: 0.006 }, DVec2::new(0.06, 0.06), "YBCO");
     scene.get_mut(supra).unwrap().temperature = -196.0;
     let region = scene.add_contours("Forme", vec![Shape::Rect { w: 0.02, h: 0.01 }.contours().remove(0)], "Aluminium").unwrap();
+    let coil = scene.add("Bobine", Shape::Coil { w: 0.02, h: 0.01, thick: 0.004 }, DVec2::new(-0.06, -0.06), "Cuivre (bobinage)");
+    let o = scene.get_mut(coil).unwrap();
+    (o.turns, o.current, o.fill) = (50.0, 1.0, 0.6);
     scene.cut_line = Some([flux_core::DVec3::new(-0.05, 0.03, 0.0), flux_core::DVec3::new(0.05, 0.03, 0.0)]);
     scene.objects[1].locked = true;
 
@@ -438,7 +481,7 @@ fn english_interface_is_fully_translated() {
     rig.idle(40);
     assert_eq!((tr("Aimant"), example(0).name.as_str()), ("Magnet", "Magnet + iron plate"));
     assert_eq!(example(0).objects[0].name, "Magnet 1");
-    for id in [1, 2, wire, bismuth, supra, region] {
+    for id in [1, 2, wire, bismuth, supra, region, coil] {
         rig.app.selected = Some(id);
         rig.app.operand = Some((id, if id == 1 { 2 } else { 1 }));
         rig.move_to(rig.at(0.0, 0.0));

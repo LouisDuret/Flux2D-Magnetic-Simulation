@@ -142,6 +142,10 @@ pub fn lua_script(scene: &Scene, results: &str, quit: bool) -> String {
             }
         }
         // Matériau propre à l'objet : il dépend de sa température, de son courant, de son état.
+        // Les deux sections d'une bobine, de courants opposés, ont chacune le leur.
+        let sections = o.conductors();
+        let split = sections.len() > 1 && mat.class != MagClass::Magnet;
+        let block = |s: usize| if split { format!("{name}s{s}") } else { name.clone() };
         let mut direction = "0".to_owned();
         match mat.class {
             MagClass::Magnet => {
@@ -161,36 +165,43 @@ pub fn lua_script(scene: &Scene, results: &str, quit: bool) -> String {
                     Some([chi, _]) => 1.0 + chi,
                     None => mat.mu_r_solver(o.temperature),
                 };
-                let current = o.amp_turns() / o.shape.area() * 1e-6;
-                match mat.curve_at(o.temperature) {
-                    Some(curve) => {
-                        let mu = curve.mu_r_initial();
-                        line!("mi_addmaterial(\"{name}\", {mu:.6}, {mu:.6}, 0, {current:.9})");
-                        line!("mi_addbhpoint(\"{name}\", 0, 0)");
-                        for p in &curve.points {
-                            line!("mi_addbhpoint(\"{name}\", {:.9}, {:.6})", p[1], p[0]);
+                for (s, (_, amps)) in sections.iter().enumerate().take(if split { 2 } else { 1 }) {
+                    let name = block(s);
+                    let current = amps * o.shape.passes() / o.shape.area() * 1e-6;
+                    match mat.curve_at(o.temperature) {
+                        Some(curve) => {
+                            let mu = curve.mu_r_initial();
+                            line!("mi_addmaterial(\"{name}\", {mu:.6}, {mu:.6}, 0, {current:.9})");
+                            line!("mi_addbhpoint(\"{name}\", 0, 0)");
+                            for p in &curve.points {
+                                line!("mi_addbhpoint(\"{name}\", {:.9}, {:.6})", p[1], p[0]);
+                            }
+                            // Au-delà du dernier point, la pente est celle du vide.
+                            let last = curve.points.last().copied().unwrap_or([1.0, MU0]);
+                            for extra in [1e6, 1e7] {
+                                line!("mi_addbhpoint(\"{name}\", {:.9}, {:.6})", last[1] + MU0 * extra, last[0] + extra);
+                            }
                         }
-                        // Au-delà du dernier point, la pente est celle du vide.
-                        let last = curve.points.last().copied().unwrap_or([1.0, MU0]);
-                        for extra in [1e6, 1e7] {
-                            line!("mi_addbhpoint(\"{name}\", {:.9}, {:.6})", last[1] + MU0 * extra, last[0] + extra);
+                        None => {
+                            line!("mi_addmaterial(\"{name}\", {mu:.9}, {mu:.9}, 0, {current:.9})");
                         }
-                    }
-                    None => {
-                        line!("mi_addmaterial(\"{name}\", {mu:.9}, {mu:.9}, 0, {current:.9})");
                     }
                 }
             }
         }
-        match interior_point(o) {
-            Some(p) => {
-                let mesh = o.shape.bounding_radius() / 20.0;
-                line!("mi_addblocklabel({:.9}, {:.9})", p.x, p.y);
-                line!("mi_selectlabel({:.9}, {:.9})", p.x, p.y);
-                line!("mi_setblockprop(\"{name}\", 0, {mesh:.9}, \"<None>\", {direction}, {group}, 0)");
-                line!("mi_clearselected()");
-            }
-            None => warnings.push(format!("{} : aucun point intérieur trouvé", o.name)),
+        // Un bloc par région de l'objet : le centre de chaque section d'une bobine, sinon son
+        // point le plus intérieur.
+        let labels: Vec<DVec2> =
+            if sections.len() > 1 { sections.iter().map(|(at, _)| *at).collect() } else { interior_point(o).into_iter().collect() };
+        if labels.is_empty() {
+            warnings.push(format!("{} : aucun point intérieur trouvé", o.name));
+        }
+        for (s, p) in labels.iter().enumerate() {
+            let (name, mesh) = (block(s), o.shape.bounding_radius() / 20.0);
+            line!("mi_addblocklabel({:.9}, {:.9})", p.x, p.y);
+            line!("mi_selectlabel({:.9}, {:.9})", p.x, p.y);
+            line!("mi_setblockprop(\"{name}\", 0, {mesh:.9}, \"<None>\", {direction}, {group}, 0)");
+            line!("mi_clearselected()");
         }
     }
 
@@ -198,7 +209,8 @@ pub fn lua_script(scene: &Scene, results: &str, quit: bool) -> String {
     let radius = scene.size / 2.0;
     let around = (0..360).map(|k| DVec2::from_angle((k as f64).to_radians()) * (0.92 * radius));
     let mut air: Vec<DVec2> = air_point(scene, around).into_iter().collect();
-    for o in &objects {
+    // Les deux sections d'une bobine ne sont pas un contour et son trou.
+    for o in objects.iter().filter(|o| !matches!(o.shape, Shape::Coil { .. })) {
         for hole in o.world_contours().iter().skip(1) {
             let (lo, hi) =
                 hole.iter().fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
@@ -285,6 +297,25 @@ mod tests {
         assert_eq!(lua.matches("mi_addarc").count(), 4 + 2);
         assert!(lua.contains("mi_saveas(\"C:/tmp/demo.fem\")") && lua.contains("openfile(\"C:/tmp/demo.txt\", \"w\")"));
         assert!(lua.contains("mo_getb(0.000000000, 0.000000000)") && lua.trim_end().ends_with("quit()"));
+        assert!(!lua.contains("ATTENTION"));
+    }
+
+    /// Une bobine reste un seul objet (un groupe, une force) mais ses deux sections ont
+    /// chacune leur bloc, de densités de courant opposées.
+    #[test]
+    fn coil_is_exported_as_two_blocks() {
+        let mut scene = Scene::default();
+        let coil = scene.add("Bobine", Shape::Coil { w: 0.04, h: 0.03, thick: 0.01 }, DVec2::new(0.01, 0.0), "Cuivre (bobinage)");
+        let o = scene.get_mut(coil).unwrap();
+        (o.turns, o.current) = (100.0, 3.0);
+        let lua = lua_script(&scene, "bobine.txt", false);
+        // 300 A sur 10 × 30 mm : 1 A/mm², sortant à droite (x = 25 mm), entrant à gauche (x = −5 mm).
+        assert!(lua.contains("mi_addmaterial(\"m1s0\", 1.000000000, 1.000000000, 0, 1.000000000)"), "{lua}");
+        assert!(lua.contains("mi_addmaterial(\"m1s1\", 1.000000000, 1.000000000, 0, -1.000000000)"));
+        assert!(lua.contains("mi_addblocklabel(0.025000000, 0.000000000)") && lua.contains("mi_addblocklabel(-0.005000000, 0.000000000)"));
+        assert_eq!(lua.matches(", 1, 0)").count(), 2, "les deux blocs sont du même groupe");
+        assert_eq!((lua.matches("mi_addblocklabel").count(), lua.matches("mi_addsegment").count()), (3, 8));
+        assert_eq!(lua.matches("write(handle, format(\"F ").count(), 1);
         assert!(!lua.contains("ATTENTION"));
     }
 

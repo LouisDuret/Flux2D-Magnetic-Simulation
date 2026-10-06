@@ -654,6 +654,13 @@ impl App {
                 length(ui, "Largeur", w);
                 length(ui, "Hauteur", h);
             }
+            Shape::Coil { w, h, thick } => {
+                length(ui, "Largeur", w);
+                length(ui, "Hauteur", h);
+                length(ui, "Épaisseur du bobinage", thick);
+                // Les deux sections ne se recouvrent pas.
+                *thick = thick.min(*w / 2.0);
+            }
             Shape::Circle { r } => length(ui, "Rayon", r),
             Shape::Ellipse { rx, ry } => {
                 length(ui, "Demi-axe X", rx);
@@ -812,7 +819,8 @@ impl App {
                     o.current = -o.current;
                 }
                 ui::kv(ui, "Ampères-tours", &fr(o.amp_turns(), 0), "A");
-                let j = o.amp_turns().abs() / area * 1e-6;
+                // Dans une bobine, chaque section porte tous les ampères-tours.
+                let j = o.amp_turns().abs() * o.shape.passes() / area * 1e-6;
                 // Au-delà d'environ 5 A/mm² en continu, le bobinage chauffe.
                 ui::kv_colored(ui, "Densité J", &fr(j, 2), "A/mm²", if j > 5.0 { t::WARN } else { t::TEXT_HI });
                 if o.turns > 1.0 {

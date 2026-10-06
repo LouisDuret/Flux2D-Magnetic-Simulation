@@ -754,16 +754,13 @@ impl App {
                 id
             }
             Tool::Coil => {
-                // Coupe d'une bobine : deux conducteurs parcourus en sens opposés.
-                let cw = (d.x * 0.2).max(1e-3);
-                let mut id = 0;
-                for sign in [-1.0, 1.0] {
-                    let pos = c + DVec2::new(sign * (d.x - cw) / 2.0, 0.0);
-                    id = self.scene.add(tr("Bobine"), Shape::Rect { w: cw, h: d.y.max(1e-3) }, pos, "Cuivre (bobinage)");
-                    let o = self.scene.get_mut(id).unwrap();
-                    // Bobinage : le cuivre occupe environ 60 % de la section.
-                    (o.turns, o.current, o.fill) = (100.0, sign, 0.6);
-                }
+                // Coupe d'une bobine : un seul objet, dont les deux sections sont parcourues en
+                // sens opposés.
+                let w = d.x.max(5e-3);
+                let id = self.scene.add(tr("Bobine"), Shape::Coil { w, h: d.y.max(1e-3), thick: 0.2 * w }, c, "Cuivre (bobinage)");
+                let o = self.scene.get_mut(id).unwrap();
+                // Bobinage : le cuivre occupe environ 60 % de la section.
+                (o.turns, o.current, o.fill) = (100.0, 1.0, 0.6);
                 id
             }
             _ => return,

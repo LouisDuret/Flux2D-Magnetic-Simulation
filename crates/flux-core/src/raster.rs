@@ -179,12 +179,20 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
         let hi = |v: f64| (((v + rad + size / 2.0) / h).ceil().max(0.0) as usize).min(n);
         cover.clear();
         let mut area = 0.0;
+        // Aire de la section « retour » d'une bobine, parcourue en sens inverse.
+        let mut back = 0.0;
+        let amps = obj.amp_turns();
+        let returns = |center: DVec3| amps != 0.0 && obj.shape.returns(obj.to_local(center).truncate());
         for cj in lo(obj.pos.y)..hi(obj.pos.y) {
             for ci in lo(obj.pos.x)..hi(obj.pos.x) {
-                let f = coverage(|p| obj.distance(p), r.cell_center(ci, cj), h);
+                let center = r.cell_center(ci, cj);
+                let f = coverage(|p| obj.distance(p), center, h);
                 if f > 0.0 {
                     cover.push((cj * n + ci, f));
                     area += f * h * h;
+                    if returns(center) {
+                        back += f * h * h;
+                    }
                 }
             }
         }
@@ -201,14 +209,15 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
         });
         // Un matériau saturable part de sa réluctivité à champ nul.
         let nu = curve.map_or(1.0 / mat.mu_r_solver(obj.temperature), |k| curves[k as usize].eval(0.0).0);
-        let jz = obj.amp_turns() / area;
+        // Chaque section porte tous les ampères-tours, renormalisés sur son aire rastérisée.
+        let (jz, jz_back) = (amps / (area - back).max(1e-300), -amps / back.max(1e-300));
         // ν_r·Br d'un aimant, renormalisé pour que son moment magnétique soit exact.
         let strength = if mat.class == MagClass::Magnet { nu * mat.br_at(obj.temperature) * obj.shape.area() / area } else { 0.0 };
         let demag = obj.demag.as_ref().filter(|_| scene.demagnetization);
         // Un motif ou une désaimantation partielle se lisent cellule par cellule.
         let varying = (strength != 0.0 && (obj.pattern != MagPattern::Uniform || demag.is_some())).then(|| obj.magnetization());
         let uniform = obj.mag_dir() * strength;
-        if jz != 0.0 || strength != 0.0 {
+        if amps != 0.0 || strength != 0.0 {
             r.sources.extend(cover.iter().map(|&(c, _)| c as u32));
         }
         for &(c, f) in &cover {
@@ -232,7 +241,8 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
                 // Un objet linéaire recouvre en partie un matériau saturable déjà posé.
                 *entry = (entry.0, entry.1 * keep as f32, (entry.2 as f64 * keep + nu * f) as f32);
             }
-            r.jz[c] = (r.jz[c] as f64 * keep + jz * f) as f32;
+            let j = if back > 0.0 && returns(r.cell_center(c % n, c / n)) { jz_back } else { jz };
+            r.jz[c] = (r.jz[c] as f64 * keep + j * f) as f32;
             r.mx[c] = (r.mx[c] as f64 * keep + m.x * f) as f32;
             r.my[c] = (r.my[c] as f64 * keep + m.y * f) as f32;
         }
@@ -298,6 +308,27 @@ mod tests {
             let r = rasterize(&s, 256);
             let total: f64 = r.jz.iter().map(|&j| j as f64).sum::<f64>() * r.h * r.h;
             assert!((total - 25.0).abs() < 1e-3, "{total}");
+        }
+    }
+
+    /// Une bobine porte ses ampères-tours dans chaque section, en sens opposés : le courant
+    /// total est nul, où qu'elle soit et quelle que soit son orientation.
+    #[test]
+    fn coil_sections_carry_opposite_currents() {
+        for (dx, angle) in [(0.0, 0.0), (0.00013, 0.0), (0.00041, 0.7), (0.0, std::f64::consts::PI)] {
+            let mut s = Scene::default();
+            let id = s.add("bobine", Shape::Coil { w: 0.04, h: 0.03, thick: 0.008 }, DVec2::new(dx, 0.002), "Cuivre (bobinage)");
+            let o = s.get_mut(id).unwrap();
+            (o.turns, o.current, o.angle) = (100.0, 2.0, angle);
+            let o = o.clone();
+            let r = rasterize(&s, 256);
+            let (mut out, mut back) = (0.0, 0.0);
+            for (c, &j) in r.jz.iter().enumerate() {
+                let side = o.to_local(r.cell_center(c % r.n, c / r.n)).x;
+                assert!(j as f64 * side >= 0.0, "le courant sort à droite et rentre à gauche");
+                *(if side > 0.0 { &mut out } else { &mut back }) += j as f64 * r.h * r.h;
+            }
+            assert!((out - 200.0).abs() < 2e-3 && (back + 200.0).abs() < 2e-3, "{out} et {back}");
         }
     }
 }

@@ -42,6 +42,14 @@ pub enum Shape {
     Region {
         contours: Vec<Contour>,
     },
+    /// Bobine vue en coupe : deux sections rectangulaires d'épaisseur `thick`, aux bords gauche
+    /// et droit d'une emprise `w` × `h`. Un courant positif sort par la section de droite (⊙)
+    /// et rentre par celle de gauche (⊗).
+    Coil {
+        w: f64,
+        h: f64,
+        thick: f64,
+    },
 }
 
 /// Nombre de segments d'un cercle ou d'une ellipse convertis en polygone.
@@ -66,13 +74,38 @@ impl Shape {
             Shape::Region { contours } => {
                 contours.iter().enumerate().map(|(i, c)| if i == 0 { signed_area(c).abs() } else { -signed_area(c).abs() }).sum()
             }
+            Shape::Coil { h, thick, .. } => 2.0 * thick * h,
+        }
+    }
+
+    /// Nombre de sections que traverse chaque spire : deux pour une bobine (aller et retour).
+    pub fn passes(&self) -> f64 {
+        if matches!(self, Shape::Coil { .. }) { 2.0 } else { 1.0 }
+    }
+
+    /// Le point `local` est-il dans la section « retour » d'une bobine, où le courant est de
+    /// sens opposé à celui de l'objet ?
+    pub fn returns(&self, local: DVec2) -> bool {
+        matches!(self, Shape::Coil { .. }) && local.x < 0.0
+    }
+
+    /// Aire, centre de gravité et moment quadratique polaire de la section (voir `moments`).
+    pub fn moments(&self) -> (f64, DVec2, f64) {
+        match self {
+            // Deux sections disjointes, symétriques par rapport au centre, et non un contour et son trou.
+            Shape::Coil { .. } => self
+                .contours()
+                .into_iter()
+                .map(|c| moments(&[c]))
+                .fold((0.0, DVec2::ZERO, 0.0), |sum, (a, c, j)| (sum.0 + a, DVec2::ZERO, sum.2 + j + a * c.length_squared())),
+            _ => moments(&self.contours()),
         }
     }
 
     /// Rectangle englobant en repère local : coins inférieur gauche et supérieur droit.
     pub fn bounds(&self) -> (DVec2, DVec2) {
         match self {
-            Shape::Rect { w, h } => (DVec2::new(-w / 2.0, -h / 2.0), DVec2::new(w / 2.0, h / 2.0)),
+            Shape::Rect { w, h } | Shape::Coil { w, h, .. } => (DVec2::new(-w / 2.0, -h / 2.0), DVec2::new(w / 2.0, h / 2.0)),
             Shape::Circle { r } | Shape::Ring { r_out: r, .. } => (DVec2::splat(-r), DVec2::splat(*r)),
             Shape::Ellipse { rx, ry } => (DVec2::new(-rx, -ry), DVec2::new(*rx, *ry)),
             _ => self
@@ -88,8 +121,9 @@ impl Shape {
         self.contours().iter().map(|c| (0..c.len()).map(|i| c[i].distance(c[(i + 1) % c.len()])).sum::<f64>()).sum()
     }
 
-    /// Contours de la forme en repère local (le premier extérieur, les suivants des trous).
-    /// Les arcs sont convertis en polygones.
+    /// Contours de la forme en repère local (le premier extérieur, les suivants des trous ;
+    /// pour une bobine, ses deux sections, celle de droite d'abord). Les arcs sont convertis
+    /// en polygones.
     pub fn contours(&self) -> Vec<Contour> {
         let ellipse = |rx: f64, ry: f64| -> Contour {
             (0..ARC_SEGMENTS)
@@ -99,10 +133,12 @@ impl Shape {
                 })
                 .collect()
         };
+        let rect = |x: f64, w: f64, h: f64| -> Contour {
+            [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(i, j)| DVec2::new(x + i * w / 2.0, j * h / 2.0)).to_vec()
+        };
         match self {
-            Shape::Rect { w, h } => {
-                vec![[(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(x, y)| DVec2::new(x * w / 2.0, y * h / 2.0)).to_vec()]
-            }
+            Shape::Rect { w, h } => vec![rect(0.0, *w, *h)],
+            Shape::Coil { w, h, thick } => vec![rect((w - thick) / 2.0, *thick, *h), rect(-(w - thick) / 2.0, *thick, *h)],
             Shape::Circle { r } => vec![ellipse(*r, *r)],
             Shape::Ellipse { rx, ry } => vec![ellipse(*rx, *ry)],
             Shape::Ring { r_in, r_out } => vec![ellipse(*r_out, *r_out), ellipse(*r_in, *r_in)],
@@ -271,11 +307,14 @@ fn contours_distance<'a>(contours: impl IntoIterator<Item = &'a Contour>, p: DVe
 impl Sdf for Shape {
     fn distance(&self, p: DVec3) -> f64 {
         let p = p.truncate();
+        let rect = |p: DVec2, w: f64, h: f64| {
+            let d = p.abs() - DVec2::new(w / 2.0, h / 2.0);
+            d.max(DVec2::ZERO).length() + d.x.max(d.y).min(0.0)
+        };
         match self {
-            Shape::Rect { w, h } => {
-                let d = p.abs() - DVec2::new(w / 2.0, h / 2.0);
-                d.max(DVec2::ZERO).length() + d.x.max(d.y).min(0.0)
-            }
+            Shape::Rect { w, h } => rect(p, *w, *h),
+            // Les deux sections sont symétriques : on se ramène à celle de droite.
+            Shape::Coil { w, h, thick } => rect(DVec2::new(p.x.abs() - (w - thick) / 2.0, p.y), *thick, *h),
             Shape::Circle { r } => p.length() - r,
             Shape::Ellipse { rx, ry } => ellipse_distance(p, *rx, *ry),
             Shape::Ring { r_in, r_out } => {
@@ -289,7 +328,7 @@ impl Sdf for Shape {
 
     fn bounding_radius(&self) -> f64 {
         match self {
-            Shape::Rect { w, h } => 0.5 * w.hypot(*h),
+            Shape::Rect { w, h } | Shape::Coil { w, h, .. } => 0.5 * w.hypot(*h),
             Shape::Circle { r } => *r,
             Shape::Ellipse { rx, ry } => rx.max(*ry),
             Shape::Ring { r_out, .. } => *r_out,
@@ -451,6 +490,28 @@ mod tests {
         let (area, center, polar) = moments(&[rect]);
         assert!((area - 8e-4).abs() < 1e-15 && (center - DVec2::new(0.03, 0.03)).length() < 1e-12);
         assert!((polar / (8e-4 * (0.04f64.powi(2) + 0.02f64.powi(2)) / 12.0) - 1.0).abs() < 1e-9);
+    }
+
+    /// Une bobine est faite de deux sections disjointes : aire, distance et moments les comptent
+    /// toutes les deux, et l'espace qui les sépare reste libre.
+    #[test]
+    fn coil_is_two_sections() {
+        let coil = Shape::Coil { w: 0.05, h: 0.03, thick: 0.01 };
+        assert!((coil.area() - 6e-4).abs() < 1e-15 && coil.passes() == 2.0);
+        assert!((coil.perimeter() - 0.16).abs() < 1e-12);
+        for (x, y, d) in
+            [(0.0, 0.0, 0.015), (0.02, 0.0, -0.005), (-0.02, 0.01, -0.005), (0.03, 0.0, 0.005), (0.0, 0.02, 0.015f64.hypot(0.005))]
+        {
+            assert!((coil.distance(DVec3::new(x, y, 0.0)) - d).abs() < 1e-12, "({x}, {y})");
+        }
+        assert!(coil.returns(DVec2::new(-0.02, 0.0)) && !coil.returns(DVec2::new(0.02, 0.0)));
+        assert!(!Shape::Rect { w: 0.05, h: 0.03 }.returns(DVec2::new(-0.02, 0.0)));
+        // Deux rectangles de 10 × 30 mm à 20 mm du centre : J = 2·S·[(w² + h²)/12 + d²].
+        let (area, center, polar) = coil.moments();
+        assert!((area - 6e-4).abs() < 1e-15 && center.length() < 1e-15);
+        assert!((polar / (6e-4 * ((0.01f64.powi(2) + 0.03f64.powi(2)) / 12.0 + 0.02f64.powi(2))) - 1.0).abs() < 1e-12);
+        let tiled: f64 = trapezoids(&coil.contours()).iter().map(|t| signed_area(t).abs()).sum();
+        assert!((tiled - 6e-4).abs() < 1e-15);
     }
 
     /// La simplification garde la forme à la tolérance près et retire les sommets superflus.

@@ -400,3 +400,48 @@ fn wire_attracted_by_a_permeable_cylinder() {
         assert!((b - inside).length() < 0.01 * inside.length(), "B dans le cylindre : {b:?} au lieu de {inside:?}");
     }
 }
+
+/// Une bobine d'un seul tenant crée le champ de deux conducteurs séparés parcourus en sens
+/// opposés, et subit la somme de leurs forces : l'opposé de celle qu'elle exerce sur l'aimant.
+#[test]
+fn coil_matches_two_opposite_conductors() {
+    let base = || {
+        let mut scene = Scene::default();
+        // Domaine large : son bord, qui confine le flux, repousserait sinon l'aimant.
+        scene.size = 0.8;
+        let magnet = scene.add("aimant", Shape::Rect { w: 0.02, h: 0.02 }, DVec2::new(0.045, 0.012), "NdFeB N42");
+        (scene, magnet)
+    };
+    let points = [DVec2::ZERO, DVec2::new(0.0, 0.02), DVec2::new(-0.03, 0.01), DVec2::new(0.016, 0.0)];
+    let sample = |cpu: &Cpu64Reference| points.map(|p| cpu.field().sample(p.extend(0.0)).unwrap().b.truncate());
+    let mut cpu = Cpu64Reference::default();
+
+    let (mut pair, _) = base();
+    let mut halves = Vec::new();
+    for (x, amps) in [(0.016, 5.0), (-0.016, -5.0)] {
+        let id = pair.add("section", Shape::Rect { w: 0.008, h: 0.03 }, DVec2::new(x, 0.0), "Cuivre (bobinage)");
+        let o = pair.get_mut(id).unwrap();
+        (o.turns, o.current) = (100.0, amps);
+        halves.push(id);
+    }
+    solve(&mut cpu, &pair, 1024);
+    let b_pair = sample(&cpu);
+    let found = forces(cpu.field(), &pair);
+    let f_pair: DVec3 = found.iter().filter(|w| halves.contains(&w.id)).map(|w| w.force).sum();
+
+    let (mut scene, magnet) = base();
+    let coil = scene.add("bobine", Shape::Coil { w: 0.04, h: 0.03, thick: 0.008 }, DVec2::ZERO, "Cuivre (bobinage)");
+    let o = scene.get_mut(coil).unwrap();
+    (o.turns, o.current) = (100.0, 5.0);
+    solve(&mut cpu, &scene, 1024);
+    for ((p, b), want) in points.iter().zip(sample(&cpu)).zip(b_pair) {
+        assert!((b - want).length() < 1e-4 * want.length(), "B en {p:?} : {b:?} au lieu de {want:?}");
+    }
+    let found = forces(cpu.field(), &scene);
+    let wrench = |id: u32| found.iter().find(|w| w.id == id).unwrap().force;
+    println!("force sur la bobine : {:?}, sur les deux sections : {f_pair:?}, sur l'aimant : {:?}", wrench(coil), wrench(magnet));
+    assert_eq!(found.len(), 2, "la bobine est un seul objet");
+    assert!(f_pair.length() > 1.0);
+    assert!((wrench(coil) - f_pair).length() < 0.02 * f_pair.length());
+    assert!((wrench(coil) + wrench(magnet)).length() < 0.02 * f_pair.length());
+}

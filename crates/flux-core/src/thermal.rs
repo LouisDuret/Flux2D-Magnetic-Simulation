@@ -44,12 +44,14 @@ impl Scene {
         self.mass(o) * self.material(&o.material).map_or(0.0, |m| m.heat_capacity)
     }
 
-    /// Résistance (Ω) de la section d'un bobinage : N spires en série, longues de la profondeur
-    /// de la scène, dont le fil a pour section la part `fill` de celle de l'objet divisée par N.
-    /// `None` si l'objet n'est pas un conducteur bobiné.
+    /// Résistance (Ω) d'un bobinage : N spires en série, longues de la profondeur de la scène,
+    /// dont le fil a pour section la part `fill` de celle de l'objet divisée par N. Une bobine
+    /// compte ses deux sections : le fil y est deux fois plus long, dans une section moitié
+    /// moindre. `None` si l'objet n'est pas un conducteur bobiné.
     pub fn resistance(&self, o: &Object) -> Option<f64> {
         let rho = self.material(&o.material)?.resistivity_at(o.temperature);
-        (rho > 0.0 && o.turns > 0.0).then(|| rho * o.turns * o.turns * self.depth / (o.fill.clamp(0.01, 1.0) * o.shape.area()))
+        let (passes, copper) = (o.shape.passes(), o.fill.clamp(0.01, 1.0) * o.shape.area());
+        (rho > 0.0 && o.turns > 0.0).then(|| rho * o.turns * o.turns * self.depth * passes * passes / copper)
     }
 
     /// Puissance dissipée par effet Joule (W).
@@ -172,6 +174,14 @@ mod tests {
         assert!(o.temperature > 30.0 && o.temperature < 150.0, "{}", o.temperature);
         assert!((s.joule_power(&o) / loss - 1.0).abs() < 1e-6);
         assert!((s.resistance(&o).unwrap() / r20 - (1.0 + 0.00393 * (o.temperature - 20.0))).abs() < 1e-9);
+
+        // Une bobine dont chaque section a cette forme résiste deux fois plus : le fil fait
+        // l'aller et le retour.
+        let mut coil = Scene::default();
+        let pair = coil.add("bobine", Shape::Coil { w: 0.02, h: 0.030, thick: 0.004 }, DVec2::ZERO, "Cuivre (bobinage)");
+        let o = coil.get_mut(pair).unwrap();
+        (o.turns, o.current, o.fill) = (100.0, 3.0, 0.6);
+        assert!((coil.resistance(&coil.objects[0]).unwrap() / (2.0 * r20) - 1.0).abs() < 1e-12);
 
         // Avec un thermostat, ou le bilan coupé, la température ne bouge plus.
         s.get_mut(id).unwrap().thermostat = true;

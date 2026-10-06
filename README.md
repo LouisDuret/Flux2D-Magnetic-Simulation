@@ -94,6 +94,7 @@ Molette : zoom · clic milieu ou glisser dans le vide : déplacer la vue
 - **Tourner** : poignée ronde au-dessus de l'objet sélectionné ; `Maj` : pas de 15°.
 - **Orienter l'aimantation** : poignée au bout de la flèche blanche de l'aimant sélectionné (`Maj` : pas de 15°) ; double-clic sur l'aimant pour saisir l'angle.
 - **Inverser un courant** : clic sur le symbole ⊙ / ⊗ du conducteur.
+- **Bobine** : glisser avec l'outil `C` crée un seul objet, vu en coupe : deux sections parcourues en sens opposés (⊙ à droite, ⊗ à gauche pour un courant positif), entre lesquelles un noyau peut prendre place. Elle se déplace, se tourne et s'inverse d'un bloc ; l'inspecteur règle sa largeur, sa hauteur et l'épaisseur du bobinage. Chaque section porte tous les ampères-tours, la résistance compte l'aller et le retour, et la force est celle de la bobine entière.
 - **Changer de matériau** : glisser une ligne de la bibliothèque sur un objet, qui en montre l'aperçu avant le relâcher.
 - **Opérations booléennes** : sélectionner un objet, `Maj` + clic sur un second, puis Union, Intersection ou Différence dans la section « Combiner » de l'inspecteur. Le résultat garde le matériau du premier objet.
 

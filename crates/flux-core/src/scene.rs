@@ -167,6 +167,17 @@ impl Object {
         self.turns * self.current
     }
 
+    /// Sections parcourues par le courant : centre (repère monde) et ampères-tours, positifs
+    /// s'ils sortent du plan. Une bobine en a deux, de sens opposés.
+    pub fn conductors(&self) -> Vec<(DVec2, f64)> {
+        match self.shape {
+            Shape::Coil { w, thick, .. } => {
+                [1.0, -1.0].map(|side| (self.to_world(DVec2::X * (side * (w - thick) / 2.0)), side * self.amp_turns())).to_vec()
+            }
+            _ => vec![(self.pos.truncate(), self.amp_turns())],
+        }
+    }
+
     /// Direction de référence de l'aimantation en repère monde (celle du motif uniforme).
     pub fn mag_dir(&self) -> DVec2 {
         DVec2::from_angle(self.angle + self.mag_angle)

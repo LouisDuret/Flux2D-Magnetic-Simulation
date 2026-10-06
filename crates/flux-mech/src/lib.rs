@@ -6,7 +6,7 @@
 
 use flux_core::DVec2;
 use flux_core::scene::{Body, Link, MechView, Object, Scene};
-use flux_core::shape::{Contour, Sdf, Shape, moments, simplify, trapezoids};
+use flux_core::shape::{Contour, Sdf, Shape, simplify, trapezoids};
 use rapier2d::prelude::*;
 
 /// Sous-pas d'intégration (s).
@@ -161,7 +161,7 @@ impl World {
         for o in scene.objects.iter().filter(|o| o.visible) {
             let density = scene.material(&o.material).map_or(0.0, |m| m.density);
             let (pos, mobile) = (o.pos.truncate(), o.body.mobile);
-            let (area, com, polar) = moments(&o.shape.contours());
+            let (area, com, polar) = o.shape.moments();
             let mass = (density * o.shape.area() * scene.depth).max(1e-9);
             let inertia = (mass * polar / area.max(1e-300)).max(1e-15);
             let mut builder = if mobile { RigidBodyBuilder::dynamic() } else { RigidBodyBuilder::fixed() };

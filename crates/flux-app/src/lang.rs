@@ -278,6 +278,7 @@ const ENGLISH: &[(&str, &str)] = &[
     ("Rotation", "Rotation"),
     ("Largeur", "Width"),
     ("Hauteur", "Height"),
+    ("Épaisseur du bobinage", "Winding thickness"),
     ("Rayon", "Radius"),
     ("Rayon intérieur", "Inner radius"),
     ("Rayon extérieur", "Outer radius"),
