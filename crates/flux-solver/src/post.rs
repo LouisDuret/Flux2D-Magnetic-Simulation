@@ -106,7 +106,7 @@ pub fn forces(field: &Field, scene: &Scene) -> Vec<Wrench> {
     let half = field.size / 2.0;
     let mut out = Vec::with_capacity(scene.objects.len());
     let mut g = Vec::new();
-    for obj in &scene.objects {
+    for obj in scene.objects.iter().filter(|o| o.visible) {
         let rad = obj.shape.bounding_radius() + (SHELL + 2.0) * h;
         let lo = |v: f64| (((v - rad + half) / h).floor().max(0.0) as usize).min(n);
         let hi = |v: f64| (((v + rad + half) / h).ceil().max(0.0) as usize).min(n);
@@ -127,7 +127,8 @@ pub fn forces(field: &Field, scene: &Scene) -> Vec<Wrench> {
                     g.push((0.5 - ds / h).clamp(0.0, 1.0));
                     continue;
                 }
-                let d_other = scene.objects.iter().filter(|o| o.id != obj.id).map(|o| o.distance(p)).fold(f64::INFINITY, f64::min);
+                let d_other =
+                    scene.objects.iter().filter(|o| o.visible && o.id != obj.id).map(|o| o.distance(p)).fold(f64::INFINITY, f64::min);
                 // La coquille démarre à une cellule de chaque surface, hors des cellules mixtes.
                 let s = (ds - h).max(0.0);
                 let o = (d_other - h).max(0.0);

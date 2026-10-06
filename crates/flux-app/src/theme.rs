@@ -70,34 +70,21 @@ pub fn mono_bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("mono-semibold".into()))
 }
 
-/// Cherche le premier fichier de police disponible : d'abord IBM Plex dans `assets/fonts`
-/// (à côté de l'exécutable ou du répertoire courant), sinon une police du système.
-fn load_font(files: &[&str]) -> Option<Vec<u8>> {
-    let mut dirs = vec![std::path::PathBuf::from("assets/fonts")];
-    if let Ok(exe) = std::env::current_exe() {
-        dirs.extend(exe.parent().map(|d| d.join("assets/fonts")));
-    }
-    dirs.extend(std::env::var_os("LOCALAPPDATA").map(|d| std::path::Path::new(&d).join("Microsoft/Windows/Fonts")));
-    dirs.extend(std::env::var_os("WINDIR").map(|d| std::path::Path::new(&d).join("Fonts")));
-    files.iter().find_map(|file| dirs.iter().find_map(|dir| std::fs::read(dir.join(file)).ok()))
-}
-
+/// Polices IBM Plex embarquées (licence OFL, voir `assets/fonts/OFL.txt`).
 fn install_fonts(ctx: &egui::Context) {
     let mut defs = egui::FontDefinitions::default();
-    let families = [
-        (FontFamily::Proportional, FontFamily::Proportional, ["IBMPlexSans-Regular.ttf", "segoeui.ttf"]),
-        (FontFamily::Name("sans-semibold".into()), FontFamily::Proportional, ["IBMPlexSans-SemiBold.ttf", "seguisb.ttf"]),
-        (FontFamily::Monospace, FontFamily::Monospace, ["IBMPlexMono-Regular.ttf", "consola.ttf"]),
-        (FontFamily::Name("mono-semibold".into()), FontFamily::Monospace, ["IBMPlexMono-SemiBold.ttf", "consolab.ttf"]),
+    let families: [(FontFamily, FontFamily, &'static [u8]); 4] = [
+        (FontFamily::Proportional, FontFamily::Proportional, include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf")),
+        (FontFamily::Name("sans-semibold".into()), FontFamily::Proportional, include_bytes!("../assets/fonts/IBMPlexSans-SemiBold.ttf")),
+        (FontFamily::Monospace, FontFamily::Monospace, include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf")),
+        (FontFamily::Name("mono-semibold".into()), FontFamily::Monospace, include_bytes!("../assets/fonts/IBMPlexMono-SemiBold.ttf")),
     ];
-    for (i, (family, fallback, files)) in families.into_iter().enumerate() {
+    for (i, (family, fallback, bytes)) in families.into_iter().enumerate() {
         // Les polices intégrées d'egui restent en repli pour les glyphes manquants.
         let mut list = defs.families.get(&fallback).cloned().unwrap_or_default();
-        if let Some(bytes) = load_font(&files) {
-            let key = format!("flux-{i}");
-            defs.font_data.insert(key.clone(), Arc::new(egui::FontData::from_owned(bytes)));
-            list.insert(0, key);
-        }
+        let key = format!("plex-{i}");
+        defs.font_data.insert(key.clone(), Arc::new(egui::FontData::from_static(bytes)));
+        list.insert(0, key);
         defs.families.insert(family, list);
     }
     ctx.set_fonts(defs);

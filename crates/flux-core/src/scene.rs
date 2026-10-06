@@ -2,7 +2,7 @@
 
 use crate::ABSOLUTE_ZERO_C;
 use crate::material::{Material, library};
-use crate::shape::{Sdf, Shape};
+use crate::shape::{BoolOp, Contour, Sdf, Shape, boolean};
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 
@@ -29,12 +29,33 @@ pub struct Object {
     pub current: f64,
     /// Température de l'objet (°C).
     pub temperature: f64,
+    /// Un objet masqué n'est ni affiché ni pris en compte dans le calcul.
+    #[serde(default = "yes")]
+    pub visible: bool,
+    /// Un objet verrouillé ne se déplace, ne se tourne et ne se supprime pas sur le canevas.
+    #[serde(default)]
+    pub locked: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Object {
     pub fn to_local(&self, p: DVec3) -> DVec3 {
         let d = (p - self.pos).truncate();
         DVec2::from_angle(-self.angle).rotate(d).extend(0.0)
+    }
+
+    pub fn to_world(&self, local: DVec2) -> DVec2 {
+        self.pos.truncate() + DVec2::from_angle(self.angle).rotate(local)
+    }
+
+    /// Contours de l'objet en repère monde (le premier extérieur, les suivants des trous).
+    pub fn world_contours(&self) -> Vec<Contour> {
+        let mut contours = self.shape.contours();
+        contours.iter_mut().flatten().for_each(|p| *p = self.to_world(*p));
+        contours
     }
 
     /// Distance signée en repère monde.
@@ -112,8 +133,44 @@ impl Scene {
             turns: 0.0,
             current: 0.0,
             temperature: self.ambient,
+            visible: true,
+            locked: false,
         });
         id
+    }
+
+    /// Ajoute un objet délimité par des contours en repère monde ; `None` si l'aire est nulle.
+    pub fn add_contours(&mut self, name: &str, contours: Vec<Contour>, material: &str) -> Option<u32> {
+        let (shape, center) = Shape::from_contours(contours)?;
+        Some(self.add(name, shape, center, material))
+    }
+
+    /// Remplace l'objet `a` par le résultat de `a op b` et supprime `b`. Un résultat en
+    /// plusieurs morceaux donne plusieurs objets. Renvoie l'identifiant du premier, ou `None`
+    /// (scène inchangée) si le résultat est vide.
+    pub fn boolean(&mut self, a: u32, b: u32, op: BoolOp) -> Option<u32> {
+        let (first, second) = (self.get(a)?, self.get(b).filter(|_| a != b)?);
+        let regions = boolean(&first.world_contours(), &second.world_contours(), op);
+        let mut template = first.clone();
+        // Le résultat n'est plus tourné : l'aimantation garde sa direction en repère monde.
+        (template.mag_angle, template.angle) = (template.mag_angle + template.angle, 0.0);
+        let mut pieces = Vec::new();
+        for (shape, center) in regions.into_iter().filter_map(Shape::from_contours) {
+            let mut piece = template.clone();
+            (piece.shape, piece.pos) = (shape, center.extend(0.0));
+            if !pieces.is_empty() {
+                piece.id = self.next_id;
+                self.next_id += 1;
+            }
+            pieces.push(piece);
+        }
+        if pieces.is_empty() {
+            return None;
+        }
+        self.objects.retain(|o| o.id != b);
+        let at = self.objects.iter().position(|o| o.id == a)?;
+        self.objects.splice(at..=at, pieces);
+        Some(a)
     }
 
     pub fn get(&self, id: u32) -> Option<&Object> {
@@ -134,9 +191,9 @@ impl Scene {
         Some(self.next_id - 1)
     }
 
-    /// Objet le plus haut dans la pile contenant le point.
+    /// Objet visible le plus haut dans la pile contenant le point.
     pub fn pick(&self, p: DVec3) -> Option<u32> {
-        self.objects.iter().rev().find(|o| o.distance(p) <= 0.0).map(|o| o.id)
+        self.objects.iter().rev().find(|o| o.visible && o.distance(p) <= 0.0).map(|o| o.id)
     }
 
     /// Ramène toute température sous le zéro absolu à −273,15 °C.
@@ -199,6 +256,40 @@ mod tests {
         let loaded = Scene::from_ron(&s.to_ron().unwrap()).unwrap();
         assert_eq!((loaded.ambient, loaded.objects[0].temperature), (ABSOLUTE_ZERO_C, ABSOLUTE_ZERO_C));
         assert_eq!(loaded.objects[1].temperature, 20.0);
+    }
+
+    #[test]
+    fn boolean_replaces_both_objects() {
+        let mut s = Scene::default();
+        let magnet = s.add("a", Shape::Rect { w: 0.04, h: 0.02 }, DVec2::ZERO, "NdFeB N42");
+        s.get_mut(magnet).unwrap().angle = std::f64::consts::FRAC_PI_2;
+        let hole = s.add("b", Shape::Circle { r: 0.005 }, DVec2::ZERO, "Fer pur (Armco)");
+        assert_eq!(s.boolean(magnet, hole, BoolOp::Difference), Some(magnet));
+        assert_eq!(s.objects.len(), 1);
+        let o = &s.objects[0];
+        assert!(matches!(o.shape, Shape::Region { .. }));
+        // L'aimant tourné de 90° reste aimanté vers le haut, et le trou est bien vide.
+        assert!((o.mag_dir() - DVec2::Y).length() < 1e-12);
+        assert_eq!(s.pick(DVec3::ZERO), None);
+        assert_eq!(s.pick(DVec3::new(0.0, 0.015, 0.0)), Some(magnet));
+        assert_eq!(s.pick(DVec3::new(0.015, 0.0, 0.0)), None);
+
+        // Un résultat vide laisse la scène intacte.
+        let far = s.add("c", Shape::Circle { r: 0.005 }, DVec2::new(0.1, 0.1), "Fer pur (Armco)");
+        assert_eq!(s.boolean(magnet, far, BoolOp::Intersection), None);
+        assert_eq!(s.objects.len(), 2);
+        assert_eq!(Scene::from_ron(&s.to_ron().unwrap()).unwrap(), s);
+    }
+
+    /// Un objet masqué est ignoré par la sélection, et un fichier sans ces champs reste lisible.
+    #[test]
+    fn hidden_objects_and_old_files() {
+        let mut s = Scene::demo();
+        s.objects[1].visible = false;
+        assert_eq!(s.pick(DVec3::new(0.02, 0.0, 0.0)), None);
+        let old = s.to_ron().unwrap().replace("visible: false,", "").replace("visible: true,", "").replace("locked: false,", "");
+        let loaded = Scene::from_ron(&old).unwrap();
+        assert!(loaded.objects.iter().all(|o| o.visible && !o.locked));
     }
 
     #[test]

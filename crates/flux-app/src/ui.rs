@@ -1,6 +1,8 @@
 //! Boîte à outils de widgets au style « instrument » : lignes de hauteur fixe séparées
 //! par des filets, contrôles à angles droits, dégradé ambre pour l'état actif.
 
+use crate::expr::{self, Quantity};
+use crate::lang::tr;
 use crate::theme::{self as t, mono, mono_bold, sans, sans_bold};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Painter, Pos2, Rect, Response, Sense, Stroke, Ui, UiBuilder, epaint, pos2, vec2,
@@ -11,9 +13,9 @@ use std::ops::RangeInclusive;
 /// Marge horizontale des panneaux.
 pub const PAD: f32 = 14.0;
 
-/// Nombre décimal à la française.
+/// Nombre décimal dans la langue de l'interface (virgule en français, point en anglais).
 pub fn fr(v: f64, decimals: usize) -> String {
-    format!("{v:.decimals$}").replace('.', ",")
+    crate::lang::decimal(v, decimals)
 }
 
 // ───────────────────────────── Peinture ─────────────────────────────
@@ -266,8 +268,28 @@ pub fn section(ui: &mut Ui, number: &str, title: &str) -> Rect {
     if !number.is_empty() {
         x = tracked(p, pos2(x, r.center().y), Align2::LEFT_CENTER, number, mono_bold(10.5), t::ACCENT).right() + 10.0;
     }
-    tracked(p, pos2(x, r.center().y), Align2::LEFT_CENTER, title, mono_bold(10.5), t::TEXT_HI);
+    tracked(p, pos2(x, r.center().y), Align2::LEFT_CENTER, tr(title), mono_bold(10.5), t::TEXT_HI);
     r
+}
+
+/// Titre vertical d'un panneau replié, lu de bas en haut à partir de `bottom`.
+pub fn vertical_title(p: &Painter, x: f32, bottom: f32, text: &str, color: Color32) {
+    let mut job = egui::text::LayoutJob::default();
+    let format = egui::TextFormat { extra_letter_spacing: 1.26, font_id: mono_bold(10.5), color, ..Default::default() };
+    job.append(text, 0.0, format);
+    let galley = p.layout_job(job);
+    let at = pos2(x - galley.size().y / 2.0, bottom);
+    p.add(epaint::TextShape::new(at, galley, color).with_angle(-std::f32::consts::FRAC_PI_2));
+}
+
+/// Bouton carré portant une icône au trait.
+pub fn icon_button(ui: &Ui, rect: Rect, id: impl Hash + std::fmt::Debug, icon: &Icon, color: Color32, tip: &str) -> Response {
+    let resp = ui.interact(rect, ui.id().with(id), Sense::click()).on_hover_text(tr(tip));
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 0.0, t::tint());
+    }
+    icon.paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(14.0, 14.0)), 1.3, if resp.hovered() { t::TEXT_HI } else { color });
+    resp
 }
 
 /// Ligne « libellé … valeur unité », en lecture seule.
@@ -278,7 +300,7 @@ pub fn kv(ui: &mut Ui, label: &str, value: &str, unit: &str) {
 pub fn kv_colored(ui: &mut Ui, label: &str, value: &str, unit: &str, color: Color32) {
     let r = row(ui, 32.0, t::LINE_SOFT);
     let p = ui.painter();
-    p.text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, label, sans(12.0), t::LABEL);
+    p.text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, tr(label), sans(12.0), t::LABEL);
     let mut right = r.right() - PAD;
     if !unit.is_empty() {
         right = p.text(pos2(right, r.center().y), Align2::RIGHT_CENTER, unit, mono(12.0), t::DIM).left() - 5.0;
@@ -289,7 +311,7 @@ pub fn kv_colored(ui: &mut Ui, label: &str, value: &str, unit: &str, color: Colo
 /// Ligne « libellé … [contrôle] unité » ; le contrôle est aligné à droite.
 pub fn kv_edit<R>(ui: &mut Ui, label: &str, unit: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
     let r = row(ui, 32.0, t::LINE_SOFT);
-    ui.painter().text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, label, sans(12.0), t::LABEL);
+    ui.painter().text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, tr(label), sans(12.0), t::LABEL);
     let inner = Rect::from_min_max(pos2(r.left() + 96.0, r.top() + 1.0), pos2(r.right() - PAD, r.bottom() - 1.0));
     let mut child = place(ui, inner, Layout::right_to_left(Align::Center));
     if !unit.is_empty() {
@@ -298,13 +320,15 @@ pub fn kv_edit<R>(ui: &mut Ui, label: &str, unit: &str, add: impl FnOnce(&mut Ui
     add(&mut child)
 }
 
-/// Champ numérique à glissement, affiché dans un multiple de l'unité SI, virgule décimale.
-pub fn number(ui: &mut Ui, v: &mut f64, factor: f64, speed: f64, decimals: usize) -> Response {
+/// Champ numérique à glissement, affiché dans l'unité de la grandeur. La saisie accepte
+/// une expression avec unités : « 12 mm + 3 mm », « 2 * 1,5 cm ».
+pub fn number(ui: &mut Ui, v: &mut f64, quantity: Quantity, speed: f64, decimals: usize) -> Response {
+    let factor = quantity.factor();
     let mut shown = *v * factor;
     let widget = egui::DragValue::new(&mut shown)
         .speed(speed)
         .custom_formatter(move |x, _| fr(x, decimals))
-        .custom_parser(|s| s.trim().replace(',', ".").parse().ok());
+        .custom_parser(move |s| expr::eval(s, quantity));
     let r = ui.add(widget);
     if r.changed() {
         *v = shown / factor;
@@ -334,8 +358,8 @@ pub fn button_row(ui: &mut Ui, id: &str, labels: &[(&str, bool)]) -> Option<usiz
             ui.painter().vline(c.left(), r.y_range(), Stroke::new(1.0, t::LINE));
         }
         if !enabled {
-            ui.painter().text(c.center(), Align2::CENTER_CENTER, label, sans(12.0), t::DISABLED);
-        } else if cell(ui, c, (id, i), label, sans(12.0), t::TEXT_MID).clicked() {
+            ui.painter().text(c.center(), Align2::CENTER_CENTER, tr(label), sans(12.0), t::DISABLED);
+        } else if cell(ui, c, (id, i), tr(label), sans(12.0), t::TEXT_MID).clicked() {
             clicked = Some(i);
         }
     }
@@ -345,12 +369,24 @@ pub fn button_row(ui: &mut Ui, id: &str, labels: &[(&str, bool)]) -> Option<usiz
 /// Sélecteur segmenté aligné à droite : le segment actif est rempli du dégradé d'accent.
 pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, label: &str, id: &str, value: &mut T, options: &[(T, &str)]) -> bool {
     let r = row(ui, 36.0, t::LINE_SOFT);
+    ui.painter().text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, tr(label), sans(12.0), t::LABEL);
+    segmented_box(ui, r.right() - PAD, r.center().y, id, value, options).0
+}
+
+/// Boîte segmentée dont le bord droit est en `right`. Renvoie si la valeur a changé, et le bord gauche.
+pub fn segmented_box<T: Copy + PartialEq>(
+    ui: &Ui,
+    right: f32,
+    center_y: f32,
+    id: &str,
+    value: &mut T,
+    options: &[(T, &str)],
+) -> (bool, f32) {
     let p = ui.painter().clone();
-    p.text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, label, sans(12.0), t::LABEL);
     let pad = if options.len() > 2 { 7.0 } else { 9.0 };
     let widths: Vec<f32> = options.iter().map(|o| text_width(&p, o.1, mono_bold(11.0)) + 2.0 * pad).collect();
     let total: f32 = widths.iter().sum();
-    let frame = Rect::from_min_size(pos2(r.right() - PAD - total - 2.0, r.center().y - 12.0), vec2(total + 2.0, 24.0));
+    let frame = Rect::from_min_size(pos2(right - total - 2.0, center_y - 12.0), vec2(total + 2.0, 24.0));
     p.rect_stroke(frame, 0.0, Stroke::new(1.0, t::LINE_CTRL), egui::StrokeKind::Inside);
     let mut x = frame.left() + 1.0;
     let mut changed = false;
@@ -369,7 +405,7 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, label: &str, id: &str, value:
             changed = true;
         }
     }
-    changed
+    (changed, frame.left())
 }
 
 /// Onglets de largeur égale, soulignés du dégradé d'accent.
@@ -404,7 +440,7 @@ pub fn slider(ui: &mut Ui, label: &str, label_width: f32, v: &mut f64, range: Ra
     let r = row(ui, 36.0, t::LINE_SOFT);
     let p = ui.painter().clone();
     let dim = |c: Color32| if enabled { c } else { c.gamma_multiply(0.4) };
-    p.text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, label, sans(12.0), dim(t::LABEL));
+    p.text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, tr(label), sans(12.0), dim(t::LABEL));
     let mut right = r.right() - PAD;
     if let Some(text) = shown {
         p.text(pos2(right, r.center().y), Align2::RIGHT_CENTER, text, mono(12.0), dim(t::TEXT_HI));
@@ -430,7 +466,7 @@ pub fn slider(ui: &mut Ui, label: &str, label_width: f32, v: &mut f64, range: Ra
 pub fn switch(ui: &mut Ui, label: &str, on: &mut bool) {
     let r = row(ui, 36.0, t::LINE_SOFT);
     let p = ui.painter().clone();
-    p.text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, label, sans(12.0), t::TEXT_MID);
+    p.text(pos2(r.left() + PAD, r.center().y), Align2::LEFT_CENTER, tr(label), sans(12.0), t::TEXT_MID);
     let outer = Rect::from_min_size(pos2(r.right() - PAD - 38.0, r.center().y - 11.0), vec2(38.0, 22.0));
     if ui.interact(outer, ui.id().with(label), Sense::click()).clicked() {
         *on = !*on;
@@ -453,7 +489,7 @@ pub fn accent_button(ui: &mut Ui, label: &str, arrow_icon: &Icon) -> bool {
     let p = ui.painter();
     p.rect_filled(b, 0.0, t::ACCENT.gamma_multiply(if resp.hovered() { 0.14 } else { 0.06 }));
     p.rect_stroke(b, 0.0, Stroke::new(1.0, t::ACCENT), egui::StrokeKind::Inside);
-    p.text(pos2(b.left() + 12.0, b.center().y), Align2::LEFT_CENTER, label, sans(12.0), t::ACCENT_TEXT);
+    p.text(pos2(b.left() + 12.0, b.center().y), Align2::LEFT_CENTER, tr(label), sans(12.0), t::ACCENT_TEXT);
     arrow_icon.paint(p, Rect::from_center_size(pos2(b.right() - 18.0, b.center().y), vec2(12.0, 12.0)), 1.4, t::ACCENT_TEXT);
     resp.clicked()
 }
@@ -469,6 +505,7 @@ pub fn note(ui: &mut Ui, text: &str, bar: Color32) {
 }
 
 /// Ligne de liste : pastille carrée, nom, valeur à droite ; barre d'accent si sélectionnée.
+/// La ligne se clique et se glisse.
 pub fn list_row(
     ui: &mut Ui,
     height: f32,
@@ -479,7 +516,7 @@ pub fn list_row(
     value: &str,
 ) -> Response {
     let r = row(ui, height, t::LINE_SOFT);
-    let resp = ui.interact(r, ui.id().with(id), Sense::click());
+    let resp = ui.interact(r, ui.id().with(id), Sense::click_and_drag());
     let p = ui.painter();
     if selected || resp.hovered() {
         p.rect_filled(r.shrink2(vec2(0.0, 0.5)), 0.0, if selected { t::tint() } else { t::tint().gamma_multiply(0.5) });

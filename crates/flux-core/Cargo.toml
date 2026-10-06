@@ -8,3 +8,4 @@ license.workspace = true
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true
+i_overlay.workspace = true

@@ -13,11 +13,12 @@ flux-solver = { path = "crates/flux-solver" }
 glam = { version = "0.32", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
+i_overlay = "9"
 rayon = "1"
 bytemuck = { version = "1", features = ["derive"] }
 wgpu = "30"
 pollster = "0.4"
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 rfd = "0.17"
 
 # Le calcul numérique est inutilisable sans optimisation, même en debug.

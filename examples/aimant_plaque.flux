@@ -19,6 +19,8 @@
             turns: 0.0,
             current: 0.0,
             temperature: 20.0,
+            visible: true,
+            locked: false,
         ),
         (
             id: 2,
@@ -34,6 +36,8 @@
             turns: 0.0,
             current: 0.0,
             temperature: 20.0,
+            visible: true,
+            locked: false,
         ),
     ],
     materials: [
@@ -402,6 +406,7 @@
         ),
     ],
     probes: [],
+    seeds: [],
     cut_line: None,
     next_id: 3,
 )

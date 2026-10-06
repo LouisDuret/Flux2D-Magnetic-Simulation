@@ -81,7 +81,7 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
     let h = size / n as f64;
     let mut r = RasterizedScene { n, size, h, nu_r: vec![1.0; n * n], jz: vec![0.0; n * n], mx: vec![0.0; n * n], my: vec![0.0; n * n] };
     let mut cover: Vec<(usize, f64)> = Vec::new();
-    for obj in &scene.objects {
+    for obj in scene.objects.iter().filter(|o| o.visible) {
         let Some(mat) = scene.material(&obj.material) else { continue };
         // Boîte englobante en indices de cellules.
         let rad = obj.shape.bounding_radius() + h;
@@ -127,6 +127,40 @@ mod tests {
     use super::*;
     use crate::shape::Shape;
     use glam::DVec2;
+
+    /// L'aire couverte sur la grille reproduit l'aire exacte de chaque forme.
+    #[test]
+    fn coverage_matches_area() {
+        let star: Vec<DVec2> =
+            (0..10).map(|k| DVec2::from_angle(k as f64 * std::f64::consts::PI / 5.0) * if k % 2 == 0 { 0.03 } else { 0.012 }).collect();
+        let (pierced, _) = Shape::from_contours(vec![
+            Shape::Rect { w: 0.05, h: 0.03 }.contours().remove(0),
+            Shape::Circle { r: 0.008 }.contours().remove(0),
+        ])
+        .unwrap();
+        let shapes =
+            [Shape::Ellipse { rx: 0.03, ry: 0.012 }, Shape::Ring { r_in: 0.012, r_out: 0.02 }, Shape::Polygon { pts: star }, pierced];
+        for shape in shapes {
+            let mut s = Scene::default();
+            let id = s.add("fer", shape.clone(), DVec2::new(0.0123, -0.0071), "Fer pur (Armco)");
+            s.get_mut(id).unwrap().angle = 0.4;
+            let r = rasterize(&s, 512);
+            // ν relatif vaut 1 dans l'air et 1/μr dans le fer, mélangés par moyenne arithmétique :
+            // on en déduit la fraction couverte de chaque cellule.
+            let nu_iron = 1.0 / 5000.0;
+            let covered: f64 = r.nu_r.iter().map(|&nu| (1.0 - nu as f64) / (1.0 - nu_iron)).sum::<f64>() * r.h * r.h;
+            assert!((covered / shape.area() - 1.0).abs() < 0.01, "{shape:?} : {covered} au lieu de {}", shape.area());
+        }
+    }
+
+    /// Un objet masqué disparaît du calcul.
+    #[test]
+    fn hidden_objects_are_not_rasterized() {
+        let mut s = Scene::demo();
+        s.objects.iter_mut().for_each(|o| o.visible = false);
+        let r = rasterize(&s, 64);
+        assert!(r.nu_r.iter().all(|&nu| nu == 1.0) && r.mx.iter().all(|&m| m == 0.0));
+    }
 
     /// Les ampères-tours rastérisés sont exacts, où que soit l'objet sur la grille.
     #[test]
