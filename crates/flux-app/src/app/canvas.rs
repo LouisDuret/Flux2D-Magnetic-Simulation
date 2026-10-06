@@ -12,9 +12,11 @@ use crate::units;
 use eframe::egui::{self, Align2, Color32, CursorIcon, Painter, PointerButton, Pos2, Rect, Sense, Stroke, Ui, Vec2, epaint, pos2, vec2};
 use eframe::egui_wgpu;
 use flux_core::DVec2;
+use flux_core::magnet::MagPattern;
 use flux_core::material::MagClass;
 use flux_core::scene::{Link, MechView, Object};
 use flux_core::shape::{PathNode, Sdf, Shape, flatten_path, trapezoids};
+use flux_core::thermal::{COLD_SPRAY, HEAT_GUN};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 /// Épaisseur des règles graduées.
@@ -137,6 +139,15 @@ impl App {
                 },
                 (Tool::Probe | Tool::Seed, ..) => Drag::Pan,
                 (Tool::Sprinkle, ..) => Drag::Sprinkle,
+                (Tool::Heat | Tool::Cold, ..) => Drag::Blow,
+                // Le pinceau ne peint que l'aimant sur lequel le geste commence.
+                (Tool::Brush, ..) => match self.scene.pick(start.extend(0.0)).and_then(|id| self.scene.get(id)) {
+                    Some(o) if !o.locked && self.scene.material(&o.material).is_some_and(|m| m.class == MagClass::Magnet) => {
+                        (self.selected, self.stroke) = (Some(o.id), DVec2::ZERO);
+                        Drag::Paint { id: o.id }
+                    }
+                    _ => Drag::Pan,
+                },
                 (Tool::Cut, ..) => Drag::Cut(start),
                 (Tool::Polygon | Tool::Bezier, ..) => Drag::Draft,
                 _ => Drag::Create(start),
@@ -175,8 +186,36 @@ impl App {
                 }
                 Some(Drag::Cut(start)) => self.scene.cut_line = Some([start.extend(0.0), cur.extend(0.0)]),
                 Some(Drag::Sprinkle) => self.visuals.sprinkle(cur, brush, self.solver.field(), self.b_max),
+                Some(Drag::Paint { id }) => {
+                    // La direction peinte est celle du geste, lissée sur quelques images.
+                    let step = resp.drag_delta();
+                    self.stroke = self.stroke * 0.7 + DVec2::new(step.x as f64, -step.y as f64) * view.scale;
+                    if self.stroke.length() > 3.0 * view.scale
+                        && let Some(o) = self.scene.get_mut(id)
+                    {
+                        let (angle, at) = ((self.stroke.to_angle() - o.angle) as f32, o.to_local(cur.extend(0.0)).truncate());
+                        let lattice = o.painted();
+                        let reach = brush.max(0.75 * lattice.cell);
+                        for k in 0..lattice.values.len() {
+                            if lattice.center(k).distance(at) <= reach {
+                                lattice.values[k] = angle;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+        }
+        // Pistolet chauffant et bombe de froid : tant que le bouton est tenu, l'objet sous le
+        // curseur se rapproche de la température du jet.
+        if matches!(self.tool, Tool::Heat | Tool::Cold)
+            && resp.is_pointer_button_down_on()
+            && ui.input(|i| i.pointer.primary_down())
+            && let Some(id) = cur.and_then(|p| self.scene.pick(p.extend(0.0)))
+        {
+            let jet = if self.tool == Tool::Heat { HEAT_GUN } else { COLD_SPRAY };
+            self.scene.blow(id, jet, ui.input(|i| i.stable_dt as f64).min(0.05));
+            ui.ctx().request_repaint();
         }
 
         // Tracé d'un polygone ou d'une courbe : chaque appui pose un sommet, glisser tire sa tangente.
@@ -229,7 +268,8 @@ impl App {
                 Tool::Probe => self.scene.probes.push(cur.extend(0.0)),
                 Tool::Seed => self.scene.seeds.push(cur.extend(0.0)),
                 Tool::Sprinkle => self.visuals.sprinkle(cur, brush, self.solver.field(), self.b_max),
-                Tool::Cut => {}
+                Tool::Cut | Tool::Heat | Tool::Cold => {}
+                Tool::Brush => self.selected = self.scene.pick(cur.extend(0.0)),
                 Tool::Polygon | Tool::Bezier => {
                     if closing || (resp.double_clicked() && self.draft.len() >= 3) {
                         self.finish_draft();
@@ -257,7 +297,7 @@ impl App {
             (Some(Hot::Rotate | Hot::Magnetize), Some(_)) => Some(CursorIcon::Grabbing),
             (Some(Hot::Rotate | Hot::Magnetize), None) => Some(CursorIcon::Grab),
             (Some(Hot::Current(_)), _) => Some(CursorIcon::PointingHand),
-            _ if drafting && hover.is_some() => Some(CursorIcon::Crosshair),
+            _ if (drafting || matches!(self.tool, Tool::Brush | Tool::Heat | Tool::Cold)) && hover.is_some() => Some(CursorIcon::Crosshair),
             _ => None,
         };
         if let Some(icon) = icon {
@@ -422,6 +462,19 @@ impl App {
             }
         }
         self.draw_draft(&painter, view, closing, ui.input(|i| i.pointer.primary_down()));
+        // Empreinte du pinceau ou du jet sous le curseur.
+        if let (Some(at), Some(color)) = (
+            hover,
+            match self.tool {
+                Tool::Brush => Some(t::ACCENT),
+                Tool::Heat => Some(t::WARN),
+                Tool::Cold => Some(t::SOUTH),
+                _ => None,
+            },
+        ) {
+            painter.circle_stroke(at, 18.0, Stroke::new(3.0, t::BG.gamma_multiply(0.6)));
+            painter.circle_stroke(at, 18.0, Stroke::new(1.2, color));
+        }
         if let Some(handles) = self.handles(view) {
             self.draw_handles(&painter, handles);
         }
@@ -502,6 +555,22 @@ impl App {
                     p.circle_filled(b, 2.5, t::TEXT_HI);
                     anchor_mark(a);
                 }
+                Link::Rope { anchor, length } => {
+                    // Fil tendu : un trait droit ; détendu : il pend sous la corde.
+                    let (a, b) = (view.to_screen(anchor), view.to_screen(center));
+                    let slack = (length - anchor.distance(center)).max(0.0);
+                    let sag = vec2(0.0, (0.5 * (slack * (slack + 2.0 * anchor.distance(center))).sqrt() / view.scale) as f32);
+                    let points: Vec<Pos2> = (0..=16)
+                        .map(|k| {
+                            let s = k as f32 / 16.0;
+                            a + (b - a) * s + sag * (4.0 * s * (1.0 - s))
+                        })
+                        .collect();
+                    p.add(egui::Shape::line(points.clone(), halo));
+                    p.add(egui::Shape::line(points, line));
+                    p.circle_filled(b, 2.5, t::TEXT_HI);
+                    anchor_mark(a);
+                }
             }
         }
     }
@@ -519,10 +588,11 @@ impl App {
         let c = view.to_screen(center);
         let up_px = vec2(up.x as f32, -up.y as f32);
         let stem = c + up_px * (reach / view.scale) as f32;
-        let magnet = self.scene.material(&o.material).filter(|m| m.class == MagClass::Magnet).map(|_| {
-            let (dir, len, _) = magnet_arrow(o, &outer, view);
-            c + dir * (len + 7.0)
-        });
+        let magnet =
+            self.scene.material(&o.material).filter(|m| m.class == MagClass::Magnet && o.pattern != MagPattern::Painted).map(|_| {
+                let (dir, len, _) = magnet_arrow(o, &outer, view);
+                c + dir * (len + 7.0)
+            });
         Some(Handles { stem, rotate: stem + up_px * 30.0, magnet })
     }
 
@@ -618,7 +688,8 @@ impl App {
             poly.iter().for_each(|q| mesh.colored_vertex(view.to_screen(*q), color));
             (2..poly.len() as u32).for_each(|k| mesh.add_triangle(base, base + k - 1, base + k));
         };
-        if magnet {
+        let uniform = o.pattern == MagPattern::Uniform;
+        if magnet && uniform {
             // Moitié nord en rouge, moitié sud en bleu, de part et d'autre de l'axe d'aimantation.
             let d = o.mag_dir();
             for quad in &quads {
@@ -626,6 +697,10 @@ impl App {
                 fill(&clip_half(quad, center, -d), t::SOUTH.gamma_multiply(0.32));
             }
             quads.iter().for_each(|quad| fill(quad, Color32::from_rgba_unmultiplied(0x1B, 0x1C, 0x22, 64)));
+        } else if magnet {
+            // Motif : fond neutre, la direction locale est donnée par les flèches.
+            quads.iter().for_each(|quad| fill(quad, t::NORTH.gamma_multiply(0.14)));
+            quads.iter().for_each(|quad| fill(quad, t::SOUTH.gamma_multiply(0.14)));
         } else {
             let tint = if mat.class == MagClass::Ferro {
                 Color32::from_rgb(0xD8, 0xDC, 0xE6).gamma_multiply(0.14)
@@ -635,6 +710,9 @@ impl App {
             quads.iter().for_each(|quad| fill(quad, tint));
         }
         p.add(egui::Shape::mesh(mesh));
+        if magnet {
+            self.draw_magnet_state(p, view, o, uniform);
+        }
         if mat.class == MagClass::Ferro && o.angle == 0.0 && matches!(o.shape, Shape::Rect { .. }) {
             // Hachures discrètes des pièces de fer.
             let hatch = p.with_clip_rect(bbox.intersect(p.clip_rect()));
@@ -665,7 +743,13 @@ impl App {
         }
         let c = view.to_screen(center);
 
-        if magnet {
+        if magnet && !uniform {
+            // La flèche de référence n'apparaît qu'avec sa poignée, sur l'aimant sélectionné.
+            if selected && o.pattern != MagPattern::Painted {
+                let (dir, len, _) = magnet_arrow(o, outer, view);
+                ui::arrow(p, c - dir * len, c + dir * len, 1.2, len.min(9.0), t::ACCENT);
+            }
+        } else if magnet {
             let (dir, len, poles) = magnet_arrow(o, outer, view);
             ui::arrow(p, c - dir * len, c + dir * len, 2.0, len.min(12.0), Color32::WHITE);
             if poles[0].min(poles[1]) > 14.0 {
@@ -702,6 +786,12 @@ impl App {
             }
             ui::tag(p, at, &text, if operand { t::ACCENT } else { color }, t::TEXT_HI);
         }
+        if self.show_ui && (o.temperature - self.scene.ambient).abs() >= 0.5 {
+            // Un objet plus chaud ou plus froid que l'air affiche sa température.
+            let text = format!("{} °C", fr(o.temperature, 0));
+            let color = if o.temperature > self.scene.ambient { t::WARN } else { t::SOUTH };
+            ui::tag(p, pos2(bbox.right() + 6.0, bbox.top() + 18.0), &text, color, t::TEXT_HI);
+        }
         if selected && self.show_ui {
             // Cote de l'encombrement horizontal.
             let (y, s) = (bbox.bottom() + 20.0, Stroke::new(1.0, t::TEXT_HI.gamma_multiply(0.55)));
@@ -713,6 +803,52 @@ impl App {
             let label = Rect::from_center_size(pos2(bbox.center().x, y + 25.0), galley.size() + vec2(10.0, 4.0));
             p.rect_filled(label, 0.0, t::overlay());
             p.galley(label.min + vec2(5.0, 2.0), galley, t::TEXT_HI);
+        }
+    }
+
+    /// État de l'aimantation d'un aimant : zones désaimantées assombries, et flèches de la
+    /// direction locale quand le motif n'est pas uniforme.
+    fn draw_magnet_state(&self, p: &Painter, view: View, o: &Object, uniform: bool) {
+        if let Some(lattice) = o.demag.as_ref().filter(|_| self.scene.demagnetization) {
+            let mut mesh = egui::Mesh::default();
+            let half = lattice.cell / 2.0;
+            for k in 0..lattice.values.len() {
+                let (local, lost) = (lattice.center(k), 1.0 - lattice.values[k].clamp(0.0, 1.0));
+                if lost < 0.02 || o.shape.distance(local.extend(0.0)) > 0.0 {
+                    continue;
+                }
+                let base = mesh.vertices.len() as u32;
+                for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                    let corner = o.to_world(local + DVec2::new(dx, dy) * half);
+                    mesh.colored_vertex(view.to_screen(corner), Color32::from_black_alpha((190.0 * lost) as u8));
+                }
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            }
+            p.add(egui::Shape::mesh(mesh));
+        }
+        if uniform {
+            return;
+        }
+        // Flèches espacées d'une vingtaine de points d'écran, sur une trame attachée à l'objet.
+        let (lo, hi) = o.shape.bounds();
+        let pitch = (20.0 * view.scale).max((hi - lo).max_element() / 28.0);
+        let magnetization = o.magnetization();
+        let count = ((hi - lo) / pitch).ceil().max(DVec2::ONE);
+        let cell = (hi - lo) / count;
+        let reach = (0.36 * cell.min_element() / view.scale) as f32;
+        for j in 0..count.y as usize {
+            for i in 0..count.x as usize {
+                let local = lo + cell * DVec2::new(i as f64 + 0.5, j as f64 + 0.5);
+                if o.shape.distance(local.extend(0.0)) > -0.15 * cell.min_element() {
+                    continue;
+                }
+                // Une zone retournée par un champ inverse est fléchée dans son nouveau sens.
+                let left = if self.scene.demagnetization { o.remanence_left(local) } else { 1.0 };
+                let d = magnetization.dir(local) * if left < 0.0 { -1.0 } else { 1.0 };
+                let (at, dir) = (view.to_screen(o.to_world(local)), vec2(d.x as f32, -d.y as f32) * reach);
+                ui::arrow(p, at - dir, at + dir, 1.3, (0.9 * reach).min(6.0), Color32::WHITE.gamma_multiply(0.85));
+            }
         }
     }
 

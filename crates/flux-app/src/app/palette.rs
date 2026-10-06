@@ -47,6 +47,9 @@ enum Command {
     Step,
     Rewind,
     View(MechView),
+    ExportFemm,
+    Remagnetize,
+    Ambient,
 }
 
 /// Texte en minuscules sans accents, pour une recherche tolérante.
@@ -69,7 +72,7 @@ impl App {
     /// Toutes les commandes : libellé dans la langue courante, raccourci, action.
     fn commands(&mut self) -> Vec<(String, &'static str, Command)> {
         const DIGITS: [&str; 7] = ["1", "2", "3", "4", "5", "6", "7"];
-        const TOOL_KEYS: [&str; 13] = ["V", "R", "E", "O", "A", "P", "B", "M", "C", "H", "L", "G", "S"];
+        const TOOL_KEYS: [&str; 16] = ["V", "R", "E", "O", "A", "P", "B", "M", "C", "H", "L", "G", "S", "N", "T", "Y"];
         let mut list = Vec::new();
         for (i, tool) in TOOLS.iter().enumerate() {
             list.push((format!("{} · {}", tr("Outil"), tr(tool.1)), TOOL_KEYS[i], Command::Tool(i)));
@@ -112,6 +115,9 @@ impl App {
             ("Revenir à l’état initial", "", Command::Rewind),
             ("Vue de dessus (table)", "", Command::View(MechView::Top)),
             ("Vue de côté (pesanteur dans le plan)", "", Command::View(MechView::Side)),
+            ("Ré-aimanter tous les aimants", "", Command::Remagnetize),
+            ("Ramener tous les objets à la température ambiante", "", Command::Ambient),
+            ("Exporter la scène pour FEMM (.lua)…", "", Command::ExportFemm),
         ];
         list.extend(simple.map(|(label, key, command)| (tr(label).to_owned(), key, command)));
         list
@@ -159,6 +165,12 @@ impl App {
             Command::Step => self.step_simulation(),
             Command::Rewind => self.rewind(),
             Command::View(view) => self.scene.mechanics.view = view,
+            Command::ExportFemm => self.export_femm(),
+            Command::Remagnetize => self.scene.remagnetize(None),
+            Command::Ambient => {
+                let ambient = self.scene.ambient;
+                self.scene.objects.iter_mut().for_each(|o| o.temperature = ambient);
+            }
         }
     }
 

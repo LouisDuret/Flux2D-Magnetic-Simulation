@@ -3,6 +3,7 @@
 
 use super::*;
 use eframe::egui::{Event, PointerButton, RawInput, pos2};
+use flux_core::magnet::MagPattern;
 use flux_core::scene::{Body, Link, MechView};
 use flux_core::shape::{BoolOp, Shape};
 use std::f64::consts::FRAC_PI_2;
@@ -464,6 +465,43 @@ fn english_interface_is_fully_translated() {
     rig.app.load(example(3), None);
     rig.app.selected = Some(2);
     rig.idle(6);
+    // Aimants : chaque motif, l'aimant surchauffé puis désaimanté, la désaimantation ignorée.
+    rig.app.load(example(5), None);
+    rig.app.selected = Some(1);
+    settle_fully(&mut rig);
+    assert!(rig.app.scene.get(1).unwrap().demag.is_some());
+    rig.idle(2);
+    rig.app.scene.demagnetization = false;
+    rig.idle(2);
+    for pattern in [MagPattern::Radial, MagPattern::Multipole { pairs: 3 }, MagPattern::Halbach { pairs: 2, flip: true }] {
+        rig.app.scene.get_mut(2).unwrap().pattern = pattern;
+        rig.app.selected = Some(2);
+        rig.idle(2);
+    }
+    rig.app.scene.get_mut(2).unwrap().painted();
+    rig.idle(2);
+    rig.app.load(example(4), None);
+    rig.app.selected = Some(1);
+    rig.idle(2);
+    // Températures : fer au-dessus de Tc, graphite anisotrope, bobine, fil de pendule, outils.
+    rig.app.load(example(6), None);
+    let hot = rig.app.scene.add("Bille", Shape::Circle { r: 0.003 }, DVec2::new(0.03, 0.02), "Nickel");
+    rig.app.scene.get_mut(hot).unwrap().temperature = 400.0;
+    rig.app.scene.get_mut(hot).unwrap().body =
+        Body { mobile: true, link: Link::Rope { anchor: DVec2::new(0.03, 0.04), length: 0.03 }, ..Body::default() };
+    let coil = rig.app.scene.add("Bobine", Shape::Rect { w: 0.004, h: 0.01 }, DVec2::new(-0.03, 0.02), "Cuivre (bobinage)");
+    let o = rig.app.scene.get_mut(coil).unwrap();
+    (o.turns, o.current, o.fill) = (50.0, 2.0, 0.6);
+    for id in [5, hot, coil] {
+        rig.app.selected = Some(id);
+        rig.idle(3);
+    }
+    rig.app.selected = None;
+    rig.app.sim.playing = false;
+    rig.idle(2);
+    rig.app.scene.objects.iter_mut().for_each(|o| (o.body.mobile, o.thermostat) = (false, true));
+    rig.key(Key::Space);
+    rig.idle(1);
     rig.app.load(example(0), None);
     rig.idle(2);
     rig.app.scene.objects[0].visible = false;
@@ -631,4 +669,170 @@ fn saturated_sheet_converges_in_the_app() {
     rig.app.scene.get_mut(1).unwrap().pos.y -= 0.002;
     settle(&mut rig);
     assert!(rig.app.newton.as_ref().unwrap().iterations <= 8);
+}
+
+/// Attend que le champ et la désaimantation des aimants s'accordent.
+fn settle_fully(rig: &mut Rig) {
+    let mut calm = 0;
+    for _ in 0..3000 {
+        rig.idle(1);
+        calm = if rig.app.pending || rig.app.dirty { 0 } else { calm + 1 };
+        if calm >= 3 {
+            return;
+        }
+    }
+    panic!("le champ et la désaimantation ne se stabilisent pas");
+}
+
+/// Le pinceau (N) peint l'aimantation : elle suit le geste, là où il passe seulement.
+#[test]
+fn brush_paints_the_magnetization() {
+    let mut rig = demo();
+    rig.app.grid_n = 256;
+    settle(&mut rig);
+    let probe = flux_core::DVec3::new(-0.025, 0.03, 0.0);
+    let before = rig.app.solver.field().sample(probe).unwrap().b;
+    rig.key(Key::N);
+    assert!(rig.app.tool == Tool::Brush);
+    // Un trait vers le haut au milieu de l'aimant de 20 × 40 mm, aimanté vers la droite.
+    rig.drag(rig.at(-25.0, -15.0), rig.at(-25.0, 15.0));
+    let o = rig.app.scene.get(1).unwrap();
+    assert_eq!((o.pattern, rig.app.selected, rig.app.undo.len()), (MagPattern::Painted, Some(1), 1));
+    let dir = |x: f64, y: f64| o.magnetization().dir(DVec2::new(x, y));
+    assert!((dir(0.0, 0.005) - DVec2::Y).length() < 0.05, "sous le trait : {:?}", dir(0.0, 0.005));
+    assert!((dir(-0.008, 0.0) - DVec2::X).length() < 1e-6, "loin du trait : {:?}", dir(-0.008, 0.0));
+    settle(&mut rig);
+    let after = rig.app.solver.field().sample(probe).unwrap().b;
+    assert!((after - before).length() > 0.02, "le champ doit suivre le motif peint");
+
+    // Commencé hors d'un aimant, le geste ne peint rien : il déplace la vue.
+    let (painted, center) = (rig.app.scene.get(1).unwrap().paint.clone(), rig.app.view_center);
+    rig.drag(rig.at(20.0, -10.0), rig.at(20.0, 10.0));
+    assert_eq!(rig.app.scene.get(1).unwrap().paint, painted);
+    assert!(rig.app.view_center != center && rig.app.scene.get(2).unwrap().pattern == MagPattern::Uniform);
+    // Annuler rend à l'aimant son motif uniforme.
+    rig.app.do_undo();
+    assert_eq!(rig.app.scene.get(1).unwrap().pattern, MagPattern::Uniform);
+}
+
+/// Pistolet chauffant (T) et bombe de froid (Y) : tenus sur une bille de nickel, ils lui font
+/// passer sa température de Curie dans un sens puis dans l'autre, et la force suit.
+#[test]
+fn heat_gun_and_freeze_spray_cross_the_curie_point() {
+    let mut scene = Scene::default();
+    scene.add("Aimant", Shape::Rect { w: 0.02, h: 0.03 }, DVec2::new(-0.02, 0.0), "NdFeB N42");
+    let ball = scene.add("Bille", Shape::Circle { r: 0.003 }, DVec2::new(0.008, 0.0), "Nickel");
+    let mut rig = Rig::new(scene);
+    rig.app.grid_n = 256;
+    settle(&mut rig);
+    let pull = |rig: &Rig| rig.app.wrenches.iter().find(|w| w.id == ball).unwrap().force.length();
+    let cold = pull(&rig);
+
+    rig.key(Key::T);
+    rig.move_to(rig.at(8.0, 0.0));
+    rig.button(true);
+    rig.idle(420);
+    rig.button(false);
+    let hot = rig.app.scene.get(ball).unwrap().temperature;
+    assert!(hot > 354.0 && hot < 500.0, "après 7 s de pistolet chauffant : {hot} °C");
+    assert_eq!(rig.app.undo.len(), 1, "tout le chauffage ne fait qu'une entrée d'historique");
+    settle(&mut rig);
+    let weak = pull(&rig);
+    assert!(weak < 0.05 * cold, "au-dessus de Tc, la bille n'est presque plus attirée : {weak} contre {cold} N/m");
+
+    rig.key(Key::Y);
+    rig.button(true);
+    rig.idle(420);
+    rig.button(false);
+    let cooled = rig.app.scene.get(ball).unwrap().temperature;
+    assert!(cooled < 20.0 && cooled > -50.0, "après 7 s de bombe de froid : {cooled} °C");
+    settle(&mut rig);
+    assert!(pull(&rig) > 0.9 * cold, "revenue sous Tc, la bille est de nouveau attirée");
+    // Hors de tout objet, le jet ne chauffe rien.
+    let before = rig.app.scene.clone();
+    rig.move_to(rig.at(40.0, 30.0));
+    rig.button(true);
+    rig.idle(5);
+    rig.button(false);
+    assert_eq!(rig.app.scene, before);
+}
+
+/// Bilan thermique : pendant la lecture, un bloc chaud revient vers l'ambiante, sauf si sa
+/// température est imposée ; « Revenir » lui rend sa température de départ.
+#[test]
+fn hot_block_cools_while_playing() {
+    let mut scene = Scene::default();
+    let block = scene.add("Bloc", Shape::Rect { w: 0.016, h: 0.06 }, DVec2::ZERO, "Fer pur (Armco)");
+    scene.get_mut(block).unwrap().temperature = 300.0;
+    scene.thermal.speed = 100.0;
+    let mut rig = Rig::new(scene);
+    rig.app.grid_n = 256;
+    settle(&mut rig);
+    rig.key(Key::Space);
+    assert!(rig.app.sim.playing, "un écart de température suffit à lancer la simulation");
+    rig.idle(120);
+    let t = rig.app.scene.get(block).unwrap().temperature;
+    // Deux secondes à ×100 : 200 s, soit un quart de la constante de temps du bloc.
+    assert!(t < 280.0 && t > 150.0, "{t} °C");
+    assert!(rig.app.undo.len() == 1 && rig.app.sim.time() > 1.5);
+    rig.key(Key::Space);
+    rig.app.rewind();
+    assert_eq!(rig.app.scene.get(block).unwrap().temperature, 300.0);
+
+    // Température imposée : plus rien n'évolue, la lecture ne démarre pas.
+    rig.app.scene.get_mut(block).unwrap().thermostat = true;
+    rig.idle(1);
+    rig.key(Key::Space);
+    assert!(!rig.app.sim.playing && !rig.app.message.is_empty());
+}
+
+/// Aimant surchauffé : la désaimantation s'installe d'elle-même, sans entrer dans l'historique,
+/// reste après refroidissement et disparaît quand on ré-aimante.
+#[test]
+fn overheated_magnet_demagnetizes_in_the_app() {
+    let mut rig = Rig::new(example(5));
+    rig.app.grid_n = 256;
+    settle_fully(&mut rig);
+    let left = rig.app.scene.get(1).unwrap().mean_remanence_left();
+    assert!(left > 0.3 && left < 0.8, "rémanence restante de l'aimant chaud : {left}");
+    assert!(rig.app.scene.get(2).unwrap().demag.is_none() && rig.app.undo.is_empty());
+
+    rig.app.scene.get_mut(1).unwrap().temperature = 20.0;
+    settle_fully(&mut rig);
+    assert!((rig.app.scene.get(1).unwrap().mean_remanence_left() - left).abs() < 0.01);
+    // Commande « Ré-aimanter tous les aimants » de la palette.
+    rig.open_palette();
+    rig.text("re-aimanter");
+    rig.idle(1);
+    rig.key(Key::Enter);
+    settle_fully(&mut rig);
+    assert!(rig.app.scene.get(1).unwrap().demag.is_none(), "à 20 °C, l'aimant ré-aimanté tient son champ");
+    // Annuler ramène l'aimant désaimanté.
+    rig.app.do_undo();
+    assert!(rig.app.scene.get(1).unwrap().demag.is_some());
+}
+
+/// Lévitation diamagnétique : la plaque de graphite flotte au-dessus du damier d'aimants,
+/// sans le toucher ni s'échapper.
+#[test]
+fn graphite_floats_above_the_checkerboard() {
+    let mut rig = Rig::new(example(6));
+    settle(&mut rig);
+    let plate = 5;
+    let weight = rig.app.scene.mass(rig.app.scene.get(plate).unwrap()) * 9.81 / rig.app.scene.depth;
+    rig.key(Key::Space);
+    let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
+    for _ in 0..360 {
+        rig.idle(1);
+        let o = rig.app.scene.get(plate).unwrap();
+        (lowest, highest) = (lowest.min(o.pos.y), highest.max(o.pos.y));
+        assert!(o.pos.x.abs() < 1e-3 && o.angle.abs() < 0.2, "la plaque s'échappe : {:?}, {} rad", o.pos, o.angle);
+    }
+    println!("plaque de graphite entre {:.2} et {:.2} mm au-dessus des aimants ; poids {weight:.3} N/m", lowest * 1e3, highest * 1e3);
+    // Dessus des aimants en y = 0, demi-épaisseur de la plaque 0,4 mm.
+    assert!(lowest > 0.0010, "la plaque retombe sur les aimants : {lowest}");
+    assert!(highest < 0.0020, "la plaque s'envole : {highest}");
+    // Elle flotte là où la portance égale son poids.
+    let lift = rig.app.wrenches.iter().find(|w| w.id == plate).unwrap().force.y;
+    assert!((lift / weight - 1.0).abs() < 0.25, "portance {lift} N/m pour un poids de {weight} N/m");
 }

@@ -69,6 +69,25 @@ impl Shape {
         }
     }
 
+    /// Rectangle englobant en repère local : coins inférieur gauche et supérieur droit.
+    pub fn bounds(&self) -> (DVec2, DVec2) {
+        match self {
+            Shape::Rect { w, h } => (DVec2::new(-w / 2.0, -h / 2.0), DVec2::new(w / 2.0, h / 2.0)),
+            Shape::Circle { r } | Shape::Ring { r_out: r, .. } => (DVec2::splat(-r), DVec2::splat(*r)),
+            Shape::Ellipse { rx, ry } => (DVec2::new(-rx, -ry), DVec2::new(*rx, *ry)),
+            _ => self
+                .contours()
+                .iter()
+                .flatten()
+                .fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(lo, hi), p| (lo.min(*p), hi.max(*p))),
+        }
+    }
+
+    /// Longueur totale des contours, trous compris (m).
+    pub fn perimeter(&self) -> f64 {
+        self.contours().iter().map(|c| (0..c.len()).map(|i| c[i].distance(c[(i + 1) % c.len()])).sum::<f64>()).sum()
+    }
+
     /// Contours de la forme en repère local (le premier extérieur, les suivants des trous).
     /// Les arcs sont convertis en polygones.
     pub fn contours(&self) -> Vec<Contour> {

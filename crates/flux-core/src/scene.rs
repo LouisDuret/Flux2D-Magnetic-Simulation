@@ -1,12 +1,14 @@
 //! Modèle de scène, sérialisé en RON versionné (extension `.flux`).
 
 use crate::ABSOLUTE_ZERO_C;
+use crate::magnet::{Lattice, MagPattern, Magnetization};
 use crate::material::{Material, library};
 use crate::shape::{BoolOp, Contour, Sdf, Shape, boolean};
+use crate::thermal::Thermal;
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Vue mécanique de la scène (section 2.7).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -45,6 +47,9 @@ pub enum Link {
     /// Ressort et amortisseur entre le centre de l'objet et le point fixe `anchor` (repère
     /// monde) : raideur en N/m, amortissement en N·s/m, longueur au repos en m.
     Spring { anchor: DVec2, stiffness: f64, damping: f64, length: f64 },
+    /// Fil inextensible de longueur `length` (m) entre le centre de l'objet et le point fixe
+    /// `anchor` (repère monde) : il retient l'objet sans le pousser (pendule).
+    Rope { anchor: DVec2, length: f64 },
 }
 
 /// Couples de matériaux à sec (section 6.5) : nom, μs, μk.
@@ -94,14 +99,30 @@ pub struct Object {
     /// Direction d'aimantation dans le repère de l'objet (rad).
     #[serde(default)]
     pub mag_angle: f64,
+    /// Motif d'aimantation, orienté par `mag_angle`.
+    #[serde(default)]
+    pub pattern: MagPattern,
+    /// Directions du motif peint (rad, repère de l'objet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint: Option<Lattice>,
+    /// Part de la rémanence qui reste, cellule par cellule, après une désaimantation
+    /// irréversible (1 : intacte, négative : aimantation retournée). `None` : aimant intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demag: Option<Lattice>,
     /// Nombre de spires traversant la section.
     #[serde(default)]
     pub turns: f64,
     /// Courant par spire (A), positif = sortant (⊙).
     #[serde(default)]
     pub current: f64,
+    /// Part de la section d'un bobinage occupée par le cuivre (1 : conducteur massif).
+    #[serde(default = "one")]
+    pub fill: f64,
     /// Température de l'objet (°C).
     pub temperature: f64,
+    /// Température imposée (bain, thermostat) : le bilan thermique ne la modifie pas.
+    #[serde(default)]
+    pub thermostat: bool,
     /// Un objet masqué n'est ni affiché ni pris en compte dans le calcul.
     #[serde(default = "yes")]
     pub visible: bool,
@@ -114,6 +135,10 @@ pub struct Object {
 
 fn yes() -> bool {
     true
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 impl Object {
@@ -142,9 +167,40 @@ impl Object {
         self.turns * self.current
     }
 
-    /// Direction d'aimantation en repère monde.
+    /// Direction de référence de l'aimantation en repère monde (celle du motif uniforme).
     pub fn mag_dir(&self) -> DVec2 {
         DVec2::from_angle(self.angle + self.mag_angle)
+    }
+
+    /// Direction de l'aimantation en chaque point, selon le motif.
+    pub fn magnetization(&self) -> Magnetization<'_> {
+        Magnetization::of(self)
+    }
+
+    /// Part de la rémanence qui reste au point `local` après désaimantation irréversible.
+    pub fn remanence_left(&self, local: DVec2) -> f64 {
+        self.demag.as_ref().map_or(1.0, |lattice| lattice.get(local) as f64)
+    }
+
+    /// Moyenne sur l'objet de la part de rémanence restante (1 : aimant intact).
+    pub fn mean_remanence_left(&self) -> f64 {
+        let Some(lattice) = &self.demag else { return 1.0 };
+        let inside = (0..lattice.values.len()).filter(|&k| self.shape.distance(lattice.center(k).extend(0.0)) <= 0.0);
+        let (sum, count) = inside.fold((0.0, 0), |(sum, count), k| (sum + lattice.values[k] as f64, count + 1));
+        if count > 0 { sum / count as f64 } else { 1.0 }
+    }
+
+    /// Passe au motif peint en gardant les directions du motif actuel, et renvoie la grille
+    /// des directions (rad, repère de l'objet).
+    pub fn painted(&mut self) -> &mut Lattice {
+        if self.pattern != MagPattern::Painted || self.paint.is_none() {
+            let mut lattice = Lattice::covering(&self.shape, 0.0);
+            let magnetization = self.magnetization();
+            let angles: Vec<f32> = (0..lattice.values.len()).map(|k| magnetization.local_angle(lattice.center(k)) as f32).collect();
+            lattice.values = angles;
+            (self.pattern, self.paint) = (MagPattern::Painted, Some(lattice));
+        }
+        self.paint.as_mut().unwrap()
     }
 }
 
@@ -169,6 +225,11 @@ pub struct Scene {
     pub cut_line: Option<[DVec3; 2]>,
     #[serde(default)]
     pub mechanics: Mechanics,
+    #[serde(default)]
+    pub thermal: Thermal,
+    /// Désaimantation irréversible des aimants prise en compte (coercivité HcJ).
+    #[serde(default = "yes")]
+    pub demagnetization: bool,
     next_id: u32,
 }
 
@@ -186,6 +247,8 @@ impl Default for Scene {
             seeds: Vec::new(),
             cut_line: None,
             mechanics: Mechanics::default(),
+            thermal: Thermal::default(),
+            demagnetization: true,
             next_id: 1,
         }
     }
@@ -213,9 +276,14 @@ impl Scene {
             angle: 0.0,
             material: material.into(),
             mag_angle: 0.0,
+            pattern: MagPattern::Uniform,
+            paint: None,
+            demag: None,
             turns: 0.0,
             current: 0.0,
+            fill: 1.0,
             temperature: self.ambient,
+            thermostat: false,
             visible: true,
             locked: false,
             body: Body::default(),
@@ -305,9 +373,31 @@ impl Scene {
             for m in scene.materials.iter_mut().filter(|m| m.bh.is_none()) {
                 m.bh = lib.iter().find(|l| l.name == m.name && l.class == m.class).and_then(|l| l.bh.clone());
             }
-            scene.schema_version = SCHEMA_VERSION;
         }
+        if scene.schema_version < 3 {
+            // Avant la version 3 : ni coercivité, ni lois de température, ni données thermiques.
+            // Les matériaux de la bibliothèque les reçoivent, et ceux qui manquaient sont ajoutés.
+            for l in library() {
+                match scene.materials.iter_mut().find(|m| m.name == l.name && m.class == l.class) {
+                    Some(m) => {
+                        // Une courbe donnée à une autre température que 20 °C remplace l'ancienne.
+                        let bh = if l.t_ref == 20.0 { m.bh.take() } else { l.bh.clone() };
+                        *m = Material { mu_r: m.mu_r, chi: m.chi, br: m.br, alpha_br: m.alpha_br, density: m.density, bh, ..l };
+                    }
+                    None => scene.materials.push(l),
+                }
+            }
+            // Les températures réglées à la main étaient tenues : elles le restent.
+            let ambient = scene.ambient;
+            scene.objects.iter_mut().for_each(|o| o.thermostat = o.temperature != ambient);
+        }
+        scene.schema_version = SCHEMA_VERSION;
         Ok(scene)
+    }
+
+    /// Rend leur aimantation d'origine à un aimant, ou à tous (`None`).
+    pub fn remagnetize(&mut self, id: Option<u32>) {
+        self.objects.iter_mut().filter(|o| id.is_none_or(|id| o.id == id)).for_each(|o| o.demag = None);
     }
 
     /// Effet Meissner : un supraconducteur refroidi à l'azote liquide et une plaque de
@@ -317,8 +407,47 @@ impl Scene {
         let magnet = s.add("Aimant", Shape::Rect { w: 0.050, h: 0.012 }, DVec2::new(0.0, -0.012), "NdFeB N42");
         s.get_mut(magnet).unwrap().mag_angle = std::f64::consts::FRAC_PI_2;
         let supra = s.add("Supra", Shape::Circle { r: 0.008 }, DVec2::new(-0.010, 0.012), "YBCO");
-        s.get_mut(supra).unwrap().temperature = -196.0;
+        // Le supraconducteur trempe dans l'azote liquide : sa température est tenue.
+        let supra = s.get_mut(supra).unwrap();
+        (supra.temperature, supra.thermostat) = (-196.0, true);
         s.add("Graphite", Shape::Rect { w: 0.016, h: 0.003 }, DVec2::new(0.022, 0.004), "Graphite pyrolytique");
+        s
+    }
+
+    /// Réseau de Halbach : l'aimantation tourne le long du barreau et concentre le champ
+    /// au-dessus de lui ; la tôle posée de ce côté est bien plus attirée que celle du dessous.
+    pub fn halbach_demo() -> Scene {
+        let mut s = Scene { name: "Réseau de Halbach".into(), ..Scene::default() };
+        let bar = s.add("Halbach", Shape::Rect { w: 0.080, h: 0.010 }, DVec2::ZERO, "NdFeB N42");
+        s.get_mut(bar).unwrap().pattern = MagPattern::Halbach { pairs: 2, flip: false };
+        s.add("Tôle dessus", Shape::Rect { w: 0.080, h: 0.003 }, DVec2::new(0.0, 0.0125), "Acier doux (S235)");
+        s.add("Tôle dessous", Shape::Rect { w: 0.080, h: 0.003 }, DVec2::new(0.0, -0.0125), "Acier doux (S235)");
+        s
+    }
+
+    /// Lévitation diamagnétique (vue de côté) : une plaque de graphite pyrolytique flotte à
+    /// un millimètre d'un damier d'aimants, là où B·∂B/∂z atteint μ0·ρ·g/|χ|.
+    pub fn levitation_demo() -> Scene {
+        let mut s = Scene { name: "Lévitation du graphite".into(), size: 0.1, ..Scene::default() };
+        s.mechanics.view = MechView::Side;
+        for (k, x) in [-0.012, -0.004, 0.004, 0.012].into_iter().enumerate() {
+            let magnet = s.add("Aimant", Shape::Rect { w: 0.008, h: 0.008 }, DVec2::new(x, -0.004), "NdFeB N52");
+            s.get_mut(magnet).unwrap().mag_angle = if k % 2 == 0 { 1.0 } else { -1.0 } * std::f64::consts::FRAC_PI_2;
+        }
+        let plate = s.add("Graphite", Shape::Rect { w: 0.020, h: 0.0008 }, DVec2::new(0.0, 0.0015), "Graphite pyrolytique");
+        s.get_mut(plate).unwrap().body = Body { mobile: true, ..Body::default() };
+        s
+    }
+
+    /// Aimant surchauffé : à 120 °C, la coercivité d'un NdFeB N42 ne suffit plus à tenir son
+    /// propre champ démagnétisant. La perte est irréversible : elle reste après refroidissement.
+    pub fn overheated_demo() -> Scene {
+        let mut s = Scene { name: "Aimant surchauffé".into(), ..Scene::default() };
+        let hot = s.add("Aimant chaud", Shape::Rect { w: 0.030, h: 0.010 }, DVec2::new(-0.030, 0.0), "NdFeB N42");
+        let hot = s.get_mut(hot).unwrap();
+        (hot.mag_angle, hot.temperature, hot.thermostat) = (std::f64::consts::FRAC_PI_2, 120.0, true);
+        let cold = s.add("Aimant témoin", Shape::Rect { w: 0.030, h: 0.010 }, DVec2::new(0.030, 0.0), "NdFeB N42");
+        s.get_mut(cold).unwrap().mag_angle = std::f64::consts::FRAC_PI_2;
         s
     }
 
@@ -406,7 +535,7 @@ mod tests {
         let mut old = String::new();
         for line in s.to_ron().unwrap().lines() {
             let word = line.trim();
-            skipping |= word.starts_with("body: (") || word.starts_with("mechanics: (");
+            skipping |= word.starts_with("body: (") || word.starts_with("mechanics: (") || word.starts_with("thermal: (");
             if !skipping {
                 old += line;
                 old.push('\n');
@@ -420,6 +549,60 @@ mod tests {
         assert_eq!(loaded.mechanics, Mechanics::default());
         assert!(loaded.material("Fer pur (Armco)").unwrap().bh.is_some());
         assert!(loaded.material("NdFeB N42").unwrap().bh.is_none());
+    }
+
+    /// Un fichier de la version 2 gagne la coercivité, les lois de température, les données
+    /// thermiques et les matériaux ajoutés depuis ; les températures réglées à la main sont tenues.
+    #[test]
+    fn version_2_files_are_upgraded() {
+        let mut s = Scene::meissner_demo();
+        s.schema_version = 2;
+        s.materials.retain(|m| !["Magnétite (Fe3O4)", "Inox austénitique 304", "Oxygène liquide"].contains(&m.name.as_str()));
+        for m in &mut s.materials {
+            let (mu_r, chi, br, alpha_br, t_curie, t_critical, density) =
+                (m.mu_r, m.chi, m.br, m.alpha_br, m.t_curie, m.t_critical, m.density);
+            let bh = m.bh.take();
+            *m = Material { mu_r, chi, br, alpha_br, t_curie, t_critical, density, bh, ..Material::new(&m.name, m.class) };
+        }
+        s.objects.iter_mut().for_each(|o| o.thermostat = false);
+        assert_eq!(s.material("NdFeB N42").unwrap().hcj, 0.0);
+        let loaded = Scene::from_ron(&s.to_ron().unwrap()).unwrap();
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert_eq!(loaded.materials.len(), library().len());
+        for l in library() {
+            assert_eq!(loaded.material(&l.name), Some(&l), "{}", l.name);
+        }
+        // Le supraconducteur à −196 °C garde sa température, les objets à l'ambiante restent libres.
+        let held: Vec<bool> = loaded.objects.iter().map(|o| o.thermostat).collect();
+        assert_eq!(held, [false, true, false]);
+        assert!(loaded.thermal.enabled && loaded.demagnetization);
+    }
+
+    /// Les grilles d'un aimant peint ou désaimanté survivent à l'enregistrement, et le motif
+    /// peint part des directions du motif qu'il remplace.
+    #[test]
+    fn painted_and_demagnetized_magnets_roundtrip() {
+        let mut s = Scene::halbach_demo();
+        let o = &mut s.objects[0];
+        let before: Vec<DVec2> = [-0.03, -0.01, 0.02].iter().map(|x| o.magnetization().dir(DVec2::new(*x, 0.001))).collect();
+        let lattice = o.painted();
+        assert_eq!((lattice.nx, lattice.ny), (24, 3));
+        assert_eq!(o.pattern, MagPattern::Painted);
+        for (x, dir) in [-0.03, -0.01, 0.02].iter().zip(before) {
+            // À la résolution de la grille près : une cellule fait 3,3 mm, soit 30° de rotation.
+            assert!(o.magnetization().dir(DVec2::new(*x, 0.001)).dot(dir) > 0.8);
+        }
+        let mut demag = Lattice::covering(&o.shape, 1.0);
+        demag.values[..36].fill(0.5);
+        o.demag = Some(demag);
+        assert!((o.mean_remanence_left() - 0.75).abs() < 1e-12);
+        assert_eq!(o.remanence_left(DVec2::new(-0.039, -0.004)), 0.5);
+        let loaded = Scene::from_ron(&s.to_ron().unwrap()).unwrap();
+        assert_eq!(loaded, s);
+        s.remagnetize(None);
+        assert_eq!(s.objects[0].mean_remanence_left(), 1.0);
+        // Un fichier sans ces grilles ne les écrit pas.
+        assert!(!Scene::demo().to_ron().unwrap().contains("demag:"));
     }
 
     /// Un objet masqué est ignoré par la sélection, et un fichier sans ces champs reste lisible.

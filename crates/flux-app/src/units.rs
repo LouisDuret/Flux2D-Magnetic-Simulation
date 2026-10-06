@@ -56,6 +56,11 @@ pub fn remanence(tesla: f64) -> (f64, &'static str) {
     if cgs() { (tesla * 10.0, "kG") } else { (tesla, "T") }
 }
 
+/// Champ coercitif : kA/m, ou kOe en CGS (1 kA/m = 4π·10⁻³ kOe).
+pub fn coercivity(amps_per_meter: f64) -> (String, &'static str) {
+    if cgs() { (decimal(amps_per_meter * 4.0 * std::f64::consts::PI * 1e-6, 2), "kOe") } else { (decimal(amps_per_meter / 1e3, 0), "kA/m") }
+}
+
 /// Nombre à trois décimales, ou en notation scientifique hors de [10⁻², 10⁴[.
 pub fn number(v: f64) -> String {
     if v == 0.0 || (1e-2..1e4).contains(&v.abs()) {

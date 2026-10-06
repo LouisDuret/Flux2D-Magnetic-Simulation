@@ -1,1 +1,5 @@
 target
+# Scripts et fichiers de travail de FEMM : régénérés par le test, ils portent des chemins locaux.
+validation/femm/*.lua
+validation/femm/*.fem
+validation/femm/*.ans

@@ -5,6 +5,7 @@
 //! renormalisées pour rester exactes quelle que soit la position sur la grille.
 
 use crate::MU0;
+use crate::magnet::MagPattern;
 use crate::material::{MagClass, NuTable};
 use crate::scene::Scene;
 use crate::shape::Sdf;
@@ -166,8 +167,9 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
         sources: Vec::new(),
     };
     let mut cover: Vec<(usize, f64)> = Vec::new();
-    // Matériaux saturables : courbes par nom de matériau et, par cellule, (courbe, fraction, reste).
-    let mut curves: Vec<(&str, Arc<NuTable>)> = Vec::new();
+    // Matériaux saturables : tables ν(B) et, par cellule, (courbe, fraction, reste). Deux objets
+    // du même matériau à des températures différentes n'ont pas la même courbe.
+    let mut curves: Vec<Arc<NuTable>> = Vec::new();
     let mut saturable: BTreeMap<usize, (u16, f32, f32)> = BTreeMap::new();
     for obj in scene.objects.iter().filter(|o| o.visible) {
         let Some(mat) = scene.material(&obj.material) else { continue };
@@ -190,24 +192,33 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
             continue;
         }
         let curve = mat.curve_at(obj.temperature).map(|bh| {
-            let k = curves.iter().position(|(name, _)| *name == mat.name).unwrap_or_else(|| {
-                curves.push((&mat.name, bh.table()));
+            let table = bh.table();
+            let k = curves.iter().position(|known| Arc::ptr_eq(known, &table)).unwrap_or_else(|| {
+                curves.push(table);
                 curves.len() - 1
             });
             k as u16
         });
         // Un matériau saturable part de sa réluctivité à champ nul.
-        let nu = curve.map_or(1.0 / mat.mu_r_solver(obj.temperature), |k| curves[k as usize].1.eval(0.0).0);
+        let nu = curve.map_or(1.0 / mat.mu_r_solver(obj.temperature), |k| curves[k as usize].eval(0.0).0);
         let jz = obj.amp_turns() / area;
-        let m = if mat.class == MagClass::Magnet {
-            obj.mag_dir() * (nu * mat.br_at(obj.temperature) * obj.shape.area() / area)
-        } else {
-            glam::DVec2::ZERO
-        };
-        if jz != 0.0 || m != glam::DVec2::ZERO {
+        // ν_r·Br d'un aimant, renormalisé pour que son moment magnétique soit exact.
+        let strength = if mat.class == MagClass::Magnet { nu * mat.br_at(obj.temperature) * obj.shape.area() / area } else { 0.0 };
+        let demag = obj.demag.as_ref().filter(|_| scene.demagnetization);
+        // Un motif ou une désaimantation partielle se lisent cellule par cellule.
+        let varying = (strength != 0.0 && (obj.pattern != MagPattern::Uniform || demag.is_some())).then(|| obj.magnetization());
+        let uniform = obj.mag_dir() * strength;
+        if jz != 0.0 || strength != 0.0 {
             r.sources.extend(cover.iter().map(|&(c, _)| c as u32));
         }
         for &(c, f) in &cover {
+            let m = match &varying {
+                Some(field) => {
+                    let local = obj.to_local(r.cell_center(c % n, c / n)).truncate();
+                    field.dir(local) * (strength * demag.map_or(1.0, |lattice| lattice.get(local) as f64))
+                }
+                None => uniform,
+            };
             let keep = 1.0 - f;
             // Le flux traverse la surface du fer (réluctances en série : moyenne de ν) mais
             // longe celle d'un supraconducteur (en parallèle : moyenne de μ).
@@ -231,7 +242,6 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
     r.sources.sort_unstable();
     r.sources.dedup();
     if !cells.is_empty() {
-        let curves = curves.into_iter().map(|(_, table)| table).collect();
         r.nonlinear = Some(Nonlinear { curves, cells, kappa: vec![0.0; n * n], lin_a: vec![0.0; (n + 1) * (n + 1)] });
     }
     r

@@ -21,7 +21,7 @@ use flux_core::material::MagClass;
 use flux_core::raster::rasterize;
 use flux_core::scene::Scene;
 use flux_core::shape::{PathNode, Sdf, Shape, flatten_path};
-use flux_solver::{Cpu64Reference, FieldSolver, Newton, Planar2DGpu, SolveStatus, Wrench, forces};
+use flux_solver::{Cpu64Reference, DEMAG_TOLERANCE, FieldSolver, Newton, Planar2DGpu, SolveStatus, Wrench, demagnetize, forces};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -40,10 +40,13 @@ enum Tool {
     Cut,
     Seed,
     Sprinkle,
+    Brush,
+    Heat,
+    Cold,
 }
 
 /// Outil, nom court, raccourci, infobulle, icône (chemin SVG sur une grille de 18).
-const TOOLS: [(Tool, &str, Key, &str, &str); 13] = [
+const TOOLS: [(Tool, &str, Key, &str, &str); 16] = [
     (Tool::Select, "Sélection", Key::V, "Sélectionner et déplacer (V)", "M4 2.5l10 5.5-4.5 1.3L7.5 14 4 2.5Z"),
     (Tool::Rect, "Rect.", Key::R, "Dessiner un bloc du matériau courant (R)", "M3 4.5h12v9H3z"),
     (Tool::Circle, "Disque", Key::E, "Dessiner un disque du matériau courant (E)", "M9 3a6 6 0 1 0 0 12A6 6 0 0 0 9 3Z"),
@@ -99,6 +102,27 @@ const TOOLS: [(Tool, &str, Key, &str, &str); 13] = [
         "Saupoudrer de la limaille de fer (S)",
         "M3 5l2-1M8 3.5l2.5.5M13 4l2 1.5M4 9.5l2.5-.5M10 9l2.5.5M3.5 14l2-1M8 13.5l2.5.5M13 13l2 1.5",
     ),
+    (
+        Tool::Brush,
+        "Pinceau",
+        Key::N,
+        "Peindre l’aimantation d’un aimant : elle suit le geste (N)",
+        "M10 9.5 15 3.5M8.5 9.5l2.5 2c-.5 2-2.5 3.5-7 3.5 1.5-1 1.8-2.2 2.2-3.5.4-1.3 1.2-2 2.3-2Z",
+    ),
+    (
+        Tool::Heat,
+        "Chauffer",
+        Key::T,
+        "Pistolet chauffant : maintenir sur un objet (T)",
+        "M9 2.5c.5 2.5 3.5 4 3.5 7.5a3.5 3.5 0 0 1-7 0c0-1.5.7-2.5 1.5-3.2.2 1.2.8 1.7 1.3 1.7C8.6 6.5 8.2 4.5 9 2.5Z",
+    ),
+    (
+        Tool::Cold,
+        "Refroidir",
+        Key::Y,
+        "Bombe de froid : maintenir sur un objet (Y)",
+        "M9 2.5v13M3.4 5.8l11.2 6.4M14.6 5.8 3.4 12.2M7.5 3.5 9 5l1.5-1.5M7.5 14.5 9 13l1.5 1.5",
+    ),
 ];
 
 enum Drag {
@@ -118,6 +142,12 @@ enum Drag {
     Draft,
     Pan,
     Sprinkle,
+    /// Pinceau d'aimantation sur un aimant.
+    Paint {
+        id: u32,
+    },
+    /// Pistolet chauffant ou bombe de froid tenus sur le canevas.
+    Blow,
 }
 
 /// Élément du canevas sous le curseur qui réagit au clic ou au glisser.
@@ -207,7 +237,15 @@ impl Prefs {
 const COLLAPSED: f32 = 28.0;
 
 /// Scènes d'exemple livrées avec l'application.
-const EXAMPLES: [&str; 4] = ["Aimant + plaque de fer", "Supraconducteur et diamagnétique", "Plaque attirée sur une table", "Tôle saturée"];
+const EXAMPLES: [&str; 7] = [
+    "Aimant + plaque de fer",
+    "Supraconducteur et diamagnétique",
+    "Plaque attirée sur une table",
+    "Tôle saturée",
+    "Réseau de Halbach",
+    "Aimant surchauffé",
+    "Lévitation du graphite",
+];
 
 /// Scène vide, nommée dans la langue courante.
 fn blank() -> Scene {
@@ -222,7 +260,10 @@ fn example(index: usize) -> Scene {
         0 => Scene::demo(),
         1 => Scene::meissner_demo(),
         2 => Scene::friction_demo(),
-        _ => Scene::saturation_demo(),
+        3 => Scene::saturation_demo(),
+        4 => Scene::halbach_demo(),
+        5 => Scene::overheated_demo(),
+        _ => Scene::levitation_demo(),
     };
     scene.name = tr(&scene.name).to_owned();
     scene.objects.iter_mut().for_each(|o| o.name = tr_name(&o.name));
@@ -351,6 +392,8 @@ pub struct App {
     /// Chemin en cours de tracé (outils Polygone et Courbe), en repère monde.
     draft: Vec<PathNode>,
     hot: Option<Hot>,
+    /// Déplacement lissé du pinceau d'aimantation (m) : il donne la direction peinte.
+    stroke: DVec2,
     /// Matériau en cours de glisser-déposer depuis la bibliothèque, et objet survolé.
     drag_material: Option<String>,
     drop_target: Option<u32>,
@@ -451,6 +494,7 @@ impl App {
             operand: None,
             draft: Vec::new(),
             hot: None,
+            stroke: DVec2::ZERO,
             drag_material: None,
             drop_target: None,
             focus_angle: false,
@@ -508,7 +552,8 @@ impl App {
 
     /// Rastérise si la scène a changé, puis itère dans le budget de l'image.
     fn step_solver(&mut self, ctx: &egui::Context) {
-        let dragging = self.edit_open || matches!(self.drag, Some(Drag::Move { .. } | Drag::Rotate { .. } | Drag::Magnetize { .. }));
+        let dragging = self.edit_open
+            || matches!(self.drag, Some(Drag::Move { .. } | Drag::Rotate { .. } | Drag::Magnetize { .. } | Drag::Paint { .. }));
         // Résolution progressive : le solveur CPU calcule en 256² pendant le geste.
         let n = if dragging && !self.use_gpu { self.grid_n.min(256) } else { self.grid_n };
         if self.dirty || n != self.solved_n || self.newton.is_none() {
@@ -535,6 +580,12 @@ impl App {
             }
             if self.status.converged {
                 self.pending = false;
+                // Désaimantation irréversible : une fois le champ convergé, jamais pendant les
+                // itérations. Si un aimant vient de perdre de sa rémanence, le champ est à refaire.
+                if demagnetize(field, &mut self.scene) >= DEMAG_TOLERANCE {
+                    self.dirty = true;
+                    ctx.request_repaint();
+                }
             } else {
                 ctx.request_repaint();
             }
@@ -631,6 +682,31 @@ impl App {
         }
     }
 
+    /// Écrit un script Lua qui reproduit la scène dans FEMM, le logiciel de référence.
+    fn export_femm(&mut self) {
+        let name = format!("{}.lua", self.scene.name);
+        let Some(path) = rfd::FileDialog::new().add_filter("FEMM Lua", &["lua"]).set_file_name(name).save_file() else { return };
+        let results = path.with_extension("txt");
+        let lua = flux_core::femm::lua_script(&self.scene, &results.display().to_string(), false);
+        self.message = match std::fs::write(&path, lua) {
+            Ok(()) => format!("{} {}", tr("Script FEMM écrit :"), path.display()),
+            Err(e) => format!("{} {e}", tr("Export impossible :")),
+        };
+    }
+
+    /// Remplace la courbe B(H) d'un matériau de la scène par une table lue dans un fichier.
+    fn import_bh(&mut self, material: &str) {
+        let Some(path) = rfd::FileDialog::new().add_filter(tr("Table B(H)"), &["csv", "txt"]).pick_file() else { return };
+        let curve = std::fs::read_to_string(&path).ok().and_then(|text| flux_core::material::BhCurve::from_text(&text));
+        match (curve, self.scene.materials.iter_mut().find(|m| m.name == material)) {
+            (Some(curve), Some(m)) => {
+                self.message = format!("{} {}", curve.points.len(), tr("points B(H) importés."));
+                m.bh = Some(curve);
+            }
+            _ => self.message = tr("Table B(H) illisible : il faut au moins deux lignes « H ; B » croissantes.").into(),
+        }
+    }
+
     /// Cadre tous les objets (ou le domaine si la scène est vide).
     fn frame_all(&mut self) {
         let (mut lo, mut hi) = (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
@@ -685,7 +761,8 @@ impl App {
                     let pos = c + DVec2::new(sign * (d.x - cw) / 2.0, 0.0);
                     id = self.scene.add(tr("Bobine"), Shape::Rect { w: cw, h: d.y.max(1e-3) }, pos, "Cuivre (bobinage)");
                     let o = self.scene.get_mut(id).unwrap();
-                    (o.turns, o.current) = (100.0, sign);
+                    // Bobinage : le cuivre occupe environ 60 % de la section.
+                    (o.turns, o.current, o.fill) = (100.0, sign, 0.6);
                 }
                 id
             }

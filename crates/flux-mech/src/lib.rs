@@ -173,6 +173,9 @@ impl World {
             let handle = physics.bodies.insert(builder);
             let shape = collider(&o.shape).density(0.0).friction(o.body.mu_s as f32).friction_combine_rule(CoefficientCombineRule::Min);
             physics.colliders.insert_with_parent(shape, handle, &mut physics.bodies);
+            // Rapier ne calcule la masse effective qu'à son premier pas ; les impulsions du
+            // premier sous-pas en ont besoin avant.
+            physics.bodies[handle].recompute_mass_properties_from_colliders(&physics.colliders);
 
             let mut pivot = None;
             let mut grip = 2.0 / 3.0 * (2.0 * inertia / mass).sqrt();
@@ -194,6 +197,11 @@ impl World {
                         .local_anchor1(vector(pos))
                         .local_anchor2(Vector::ZERO)
                         .local_axis2(vector(DVec2::from_angle(angle - o.angle)));
+                    physics.impulse_joints.insert(ground, handle, joint, true);
+                }
+                Link::Rope { anchor, length } if mobile => {
+                    // Le fil part du centre de l'objet et ne travaille qu'en traction.
+                    let joint = RopeJointBuilder::new(length as f32).local_anchor1(vector(anchor)).local_anchor2(Vector::ZERO);
                     physics.impulse_joints.insert(ground, handle, joint, true);
                 }
                 _ => {}
@@ -341,10 +349,15 @@ impl World {
                 }
             }
             e.motion.sliding = sliding;
+            // Les efforts sont donnés d'un coup au début du sous-pas, comme une impulsion :
+            // v ← v + a·dt, puis x ← x + v·dt (Euler symplectique). Appliqués comme une force,
+            // Rapier les étalerait sur ses quatre temps internes, soit x ← x + v·dt + (5/8)·a·dt² :
+            // avec une force qui dépend de la position (aimant, ressort), un objet qui oscille
+            // gagnerait de l'énergie à chaque période.
             body.reset_forces(true);
             body.reset_torques(true);
-            body.add_force(vector(force), true);
-            body.add_torque(torque as f32, true);
+            body.apply_impulse(vector(force * DT), true);
+            body.apply_torque_impulse((torque * DT) as f32, true);
         }
         self.physics.step();
         self.time += DT;
@@ -394,6 +407,14 @@ impl World {
             let body = &self.physics.bodies[e.handle];
             e.mark = (dvec(body.translation()), body.rotation().angle() as f64);
         }
+    }
+
+    /// Position, angle (dans ]−π, π]) et rayon englobant d'un objet mobile ; `None` s'il est
+    /// fixe ou absent.
+    pub fn pose(&self, id: u32) -> Option<(DVec2, f64, f64)> {
+        let e = self.entries.iter().find(|e| e.id == id)?;
+        let body = &self.physics.bodies[e.handle];
+        body.is_dynamic().then(|| (dvec(body.translation()), body.rotation().angle() as f64, e.radius))
     }
 
     /// Mouvement d'un objet mobile ; `None` s'il est fixe ou absent.

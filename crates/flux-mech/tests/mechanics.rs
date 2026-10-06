@@ -85,7 +85,8 @@ fn pivot_and_torque() {
     let mut world = World::new(&scene);
     run(&mut world, &mut scene, id, DVec2::new(0.3, -0.2), torque, 0.2);
     let o = scene.get(id).unwrap();
-    assert_close(o.angle, 0.5 * torque / inertia * 0.04, 0.02, "angle sous couple constant");
+    // Intégré pas à pas (v puis x), l'angle vaut ½·(τ/I)·t²·(1 + 1/N) après N = 48 sous-pas.
+    assert_close(o.angle, 0.5 * torque / inertia * 0.04 * (1.0 + 1.0 / 48.0), 0.005, "angle sous couple constant");
     // Le pivot retient le centre malgré la force.
     assert!((o.pos.truncate() - DVec2::new(0.02, 0.03)).length() < 2e-5, "{:?}", o.pos);
 
@@ -225,6 +226,75 @@ fn pendulum_period() {
     let d = length / 2.0;
     let inertia_over_mass = (length * length + width * width) / 12.0 + d * d;
     assert_close(crossings[2] - crossings[1], 2.0 * PI * (inertia_over_mass / (G * d)).sqrt(), 0.02, "période du pendule");
+}
+
+/// Vue de côté, bille au bout d'un fil : le fil tendu en fait un pendule simple de période
+/// 2π·√(L/g) ; détendu, il laisse la bille tomber librement.
+#[test]
+fn rope_makes_a_pendulum() {
+    let mut scene = Scene::default();
+    scene.mechanics.view = MechView::Side;
+    let (length, anchor) = (0.10, DVec2::new(0.0, 0.05));
+    let start = anchor + DVec2::from_angle(-PI / 2.0 + 0.1) * length;
+    let id = scene.add("bille", Shape::Circle { r: 0.004 }, start, "Acier doux (S235)");
+    scene.get_mut(id).unwrap().body = Body { mobile: true, mu_s: 0.0, mu_k: 0.0, link: Link::Rope { anchor, length } };
+    let mut world = World::new(&scene);
+    let (mut crossings, mut last) = (Vec::new(), start.x);
+    for k in 0..1200 {
+        world.step(&scene, &[]);
+        world.write(&mut scene);
+        let p = scene.get(id).unwrap().pos.truncate();
+        assert!((p - anchor).length() < length * 1.005, "le fil s'allonge : {} m", (p - anchor).length());
+        if last > 0.0 && p.x <= 0.0 {
+            crossings.push((k as f64 + last / (last - p.x)) * DT);
+        }
+        last = p.x;
+    }
+    assert!(crossings.len() >= 3, "{crossings:?}");
+    // Une bille pleine au bout du fil : I = m·(L² + r²/2), soit 0,04 % de plus que le pendule simple.
+    assert_close(crossings[2] - crossings[1], 2.0 * PI * (length / G).sqrt(), 0.02, "période du pendule au bout du fil");
+
+    // Fil détendu : la bille, lâchée sous l'ancrage à mi-longueur, tombe comme si le fil n'existait pas.
+    let o = scene.get_mut(id).unwrap();
+    (o.pos.x, o.pos.y) = (0.0, anchor.y - 0.05);
+    let mut world = World::new(&scene);
+    for _ in 0..12 {
+        world.step(&scene, &[]);
+    }
+    world.write(&mut scene);
+    let fallen = anchor.y - 0.05 - scene.get(id).unwrap().pos.y;
+    assert_close(fallen, 0.5 * G * (12.0 * DT).powi(2), 0.05, "chute avec le fil détendu");
+}
+
+/// Une plaque portée par une force qui décroît avec la hauteur (lévitation) oscille sans
+/// gagner ni perdre d'énergie : les efforts extérieurs sont intégrés par un schéma symplectique.
+#[test]
+fn position_dependent_force_conserves_energy() {
+    let (rest, range) = (0.00143, 0.0009);
+    let mut scene = Scene::default();
+    scene.size = 0.1;
+    scene.mechanics.view = MechView::Side;
+    let id = scene.add("plaque", Shape::Rect { w: 0.02, h: 0.0008 }, DVec2::new(0.0, 0.0016), "Graphite pyrolytique");
+    scene.get_mut(id).unwrap().body = Body { mobile: true, mu_s: 0.4, mu_k: 0.2, link: Link::Free };
+    let mass = scene.mass(scene.get(id).unwrap());
+    let mut world = World::new(&scene);
+    let mut spans = Vec::new();
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for k in 0..2400 {
+        // Portance égale au poids à la hauteur `rest`, divisée par e tous les 0,9 mm.
+        let lift = mass * G * (-(scene.get(id).unwrap().pos.y - rest) / range).exp();
+        world.step(&scene, &[Load { id, force: DVec2::new(0.0, lift), torque: 0.0 }]);
+        world.write(&mut scene);
+        let y = scene.get(id).unwrap().pos.y;
+        (lo, hi) = (lo.min(y), hi.max(y));
+        if k % 240 == 239 {
+            spans.push(hi - lo);
+            (lo, hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        }
+    }
+    println!("amplitude crête à crête, seconde après seconde : {spans:?}");
+    assert!(spans.iter().all(|s| (s / spans[0] - 1.0).abs() < 0.01), "{spans:?}");
+    assert!(spans[0] > 2e-4 && spans[0] < 8e-4);
 }
 
 /// Un objet mobile poussé contre un obstacle fixe s'y arrête, quelle que soit la forme.

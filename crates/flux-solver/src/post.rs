@@ -1,8 +1,7 @@
 //! Post-traitement : échantillonnage du champ et forces par objet.
 
 use flux_core::MU0;
-use flux_core::material::MagClass;
-use flux_core::scene::Scene;
+use flux_core::scene::{Object, Scene};
 use flux_core::shape::Sdf;
 use glam::{DVec2, DVec3};
 
@@ -94,41 +93,76 @@ impl Field {
     }
 }
 
+/// Objet visible et la rotation qui ramène un point du monde dans son repère, calculée une fois.
+struct Placed<'a> {
+    obj: &'a Object,
+    turn: DVec2,
+}
+
+impl Placed<'_> {
+    fn distance(&self, p: DVec2) -> f64 {
+        self.obj.shape.distance(self.turn.rotate(p - self.obj.pos.truncate()).extend(0.0))
+    }
+}
+
 /// Forces par objet : tenseur de Maxwell pondéré (méthode de la coquille).
 ///
 /// F = −∫ T·∇g dS, où g vaut 1 sur l'objet et 0 sur les autres objets et au loin.
 /// Le support de ∇g reste dans l'air, où T = (B⊗B − ½B²·I)/μ0.
 pub fn forces(field: &Field, scene: &Scene) -> Vec<Wrench> {
+    forces_on(field, scene, None)
+}
+
+/// Forces sur les seuls objets `only` (tous si `None`), les autres restant pris en compte
+/// comme voisins.
+pub fn forces_on(field: &Field, scene: &Scene, only: Option<&[u32]>) -> Vec<Wrench> {
     let (n, h) = (field.n, field.h());
     if n == 0 {
         return Vec::new();
     }
     let half = field.size / 2.0;
-    let mut out = Vec::with_capacity(scene.objects.len());
+    let placed: Vec<Placed> =
+        scene.objects.iter().filter(|o| o.visible).map(|obj| Placed { obj, turn: DVec2::from_angle(-obj.angle) }).collect();
+    let mut out = Vec::with_capacity(placed.len());
     let mut g = Vec::new();
-    for obj in scene.objects.iter().filter(|o| o.visible) {
-        let rad = obj.shape.bounding_radius() + (SHELL + 2.0) * h;
-        let lo = |v: f64| (((v - rad + half) / h).floor().max(0.0) as usize).min(n);
-        let hi = |v: f64| (((v + rad + half) / h).ceil().max(0.0) as usize).min(n);
-        let (i0, i1, j0, j1) = (lo(obj.pos.x), hi(obj.pos.x), lo(obj.pos.y), hi(obj.pos.y));
+    for (index, this) in placed.iter().enumerate() {
+        let obj = this.obj;
+        if only.is_some_and(|ids| !ids.contains(&obj.id)) {
+            continue;
+        }
+        // Matériaux faiblement magnétiques (para, dia, fer au-dessus de Tc) : invisibles pour le
+        // solveur (μr = 1), ils subissent la force de Kelvin F = (1/2μ0)·∫ ∇(B·χ·B) dS, exacte
+        // au premier ordre en χ. Le tenseur χ vaut χ⊥ le long de l'axe Y de l'objet, χ∥ en travers.
+        let kelvin = scene.material(&obj.material).and_then(|m| m.weak_chi(obj.temperature));
+        // Rectangle englobant de l'objet, élargi de la coquille d'intégration.
+        let margin = if kelvin.is_some() { 2.0 } else { SHELL + 2.0 } * h;
+        let (low, high) = obj
+            .world_contours()
+            .iter()
+            .flatten()
+            .fold((DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)), |(low, high), p| (low.min(*p), high.max(*p)));
+        let lo = |v: f64| (((v - margin + half) / h).floor().max(0.0) as usize).min(n);
+        let hi = |v: f64| (((v + margin + half) / h).ceil().max(0.0) as usize).min(n);
+        let (i0, i1, j0, j1) = (lo(low.x), hi(high.x), lo(low.y), hi(high.y));
         let w = i1 - i0 + 1;
-        // Para/diamagnétiques : invisibles pour le solveur (μr = 1), ils subissent la force
-        // de Kelvin F = (χ/2μ0)·∫ ∇(B²) dS, exacte au premier ordre en χ.
-        let kelvin =
-            scene.material(&obj.material).filter(|m| matches!(m.class, MagClass::Para | MagClass::Dia)).map(|m| m.chi_at(obj.temperature));
+        let axis = DVec2::from_angle(obj.angle + std::f64::consts::FRAC_PI_2);
         let mut limited = false;
         g.clear();
         for j in j0..=j1 {
             for i in i0..=i1 {
-                let p = DVec3::new(i as f64 * h - half, j as f64 * h - half, 0.0);
-                let ds = obj.distance(p);
+                let p = DVec2::new(i as f64 * h - half, j as f64 * h - half);
+                let ds = this.distance(p);
                 if kelvin.is_some() {
                     // Indicatrice de l'objet, adoucie sur une cellule.
                     g.push((0.5 - ds / h).clamp(0.0, 1.0));
                     continue;
                 }
-                let d_other =
-                    scene.objects.iter().filter(|o| o.visible && o.id != obj.id).map(|o| o.distance(p)).fold(f64::INFINITY, f64::min);
+                let d_other = placed
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != index)
+                    .map(|(_, other)| other.distance(p))
+                    .fold(f64::INFINITY, f64::min);
                 // La coquille démarre à une cellule de chaque surface, hors des cellules mixtes.
                 let s = (ds - h).max(0.0);
                 let o = (d_other - h).max(0.0);
@@ -148,13 +182,22 @@ pub fn forces(field: &Field, scene: &Scene) -> Vec<Wrench> {
                 let k = (j - j0) * w + (i - i0);
                 let (g00, g10, g01, g11) = (g[k], g[k + 1], g[k + w], g[k + w + 1]);
                 let grad = DVec2::new((g10 + g11) - (g00 + g01), (g01 + g11) - (g00 + g10)) / (2.0 * h);
+                let inside = (g00 + g10 + g01 + g11) / 4.0;
+                if let Some([perp, par]) = kelvin
+                    && perp != par
+                    && inside > 0.0
+                {
+                    // Un matériau anisotrope s'aimante en biais du champ : couple M × B.
+                    let b = field.b_cell(i, j);
+                    torque += inside * (par - perp) * b.perp_dot(axis) * b.dot(axis) / MU0 * h * h;
+                }
                 if grad == DVec2::ZERO {
                     continue;
                 }
                 let b = field.b_cell(i, j);
                 let t_grad = match kelvin {
-                    // ∫ g·∇(B²) dS = −∫ B²·∇g dS.
-                    Some(chi) => 0.5 * chi * b.length_squared() * grad / MU0,
+                    // ∫ g·∇(B·χ·B) dS = −∫ (B·χ·B)·∇g dS.
+                    Some([perp, par]) => 0.5 * (perp * b.dot(axis).powi(2) + par * b.perp_dot(axis).powi(2)) * grad / MU0,
                     None => (b * b.dot(grad) - 0.5 * b.length_squared() * grad) / MU0,
                 };
                 let df = -t_grad * h * h;

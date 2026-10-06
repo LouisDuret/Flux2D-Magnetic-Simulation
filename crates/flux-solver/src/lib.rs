@@ -6,14 +6,16 @@
 //! exactement le même algorithme.
 
 pub mod cpu;
+pub mod demag;
 pub mod gpu;
 pub mod nonlinear;
 pub mod post;
 
 pub use cpu::Cpu64Reference;
+pub use demag::{DEMAG_TOLERANCE, demagnetize, solve_with_demagnetization};
 pub use gpu::Planar2DGpu;
 pub use nonlinear::Newton;
-pub use post::{Field, FieldSample, Wrench, forces};
+pub use post::{Field, FieldSample, Wrench, forces, forces_on};
 
 use flux_core::raster::RasterizedScene;
 use std::time::Duration;

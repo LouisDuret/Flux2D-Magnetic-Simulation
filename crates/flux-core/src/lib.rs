@@ -1,10 +1,13 @@
 //! Cœur de Flux2D : matériaux, formes, scène et rastérisation.
 //! Aucune dépendance à une fenêtre ou à un GPU.
 
+pub mod femm;
+pub mod magnet;
 pub mod material;
 pub mod raster;
 pub mod scene;
 pub mod shape;
+pub mod thermal;
 
 pub use glam::{DVec2, DVec3};
 

@@ -28,6 +28,9 @@ fn write_examples() {
         ("supraconducteur.flux", Scene::meissner_demo()),
         ("plaque_sur_table.flux", Scene::friction_demo()),
         ("tole_saturee.flux", Scene::saturation_demo()),
+        ("reseau_halbach.flux", Scene::halbach_demo()),
+        ("aimant_surchauffe.flux", Scene::overheated_demo()),
+        ("levitation_graphite.flux", Scene::levitation_demo()),
     ];
     for (file, scene) in scenes {
         std::fs::write(format!("{dir}/{file}"), scene.to_ron().unwrap()).unwrap();

@@ -7,10 +7,11 @@ use crate::theme::{self as t, mono, mono_bold, sans, sans_bold};
 use crate::ui::{self, PAD, fr};
 use crate::units::{self, Units};
 use eframe::egui::{self, Align, Align2, Color32, CursorIcon, Layout, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
-use flux_core::material::{MagClass, NuTable};
+use flux_core::magnet::MagPattern;
+use flux_core::material::{KNEE, MagClass, Material, NuTable};
 use flux_core::scene::{Link, MechView, Object, SURFACES};
 use flux_core::shape::{BoolOp, Sdf, Shape};
-use flux_core::{ABSOLUTE_ZERO_C, DVec2, DVec3};
+use flux_core::{ABSOLUTE_ZERO_C, DVec2, DVec3, MU0};
 use flux_solver::Field;
 
 /// Prépare un panneau : lignes jointives. Renvoie son rectangle.
@@ -42,6 +43,26 @@ fn mean_b(field: &Field, o: &Object) -> Option<f64> {
         }
     }
     (count > 0).then(|| sum / count as f64)
+}
+
+/// Plus fort champ inverse subi par un aimant le long de son aimantation (A/m), relevé sur une
+/// grille de points intérieurs ; `None` si aucun point ne tombe dedans. Avec `ideal`, la
+/// désaimantation déjà subie est ignorée.
+fn reverse_field(field: &Field, o: &Object, mat: &Material, ideal: bool) -> Option<f64> {
+    let (lo, hi) = o.shape.bounds();
+    let (magnetization, br) = (o.magnetization(), mat.br_at(o.temperature));
+    let mut worst: Option<f64> = None;
+    for k in 0..13 * 13 {
+        let local = lo + (hi - lo) * DVec2::new(((k % 13) as f64 + 0.5) / 13.0, ((k / 13) as f64 + 0.5) / 13.0);
+        if o.shape.distance(local.extend(0.0)) > -field.h() {
+            continue;
+        }
+        let Some(sample) = field.sample(o.to_world(local).extend(0.0)) else { continue };
+        let left = if ideal { 1.0 } else { o.remanence_left(local) };
+        let h = (sample.b.truncate().dot(magnetization.dir(local)) - left * br) / (MU0 * mat.mu_r);
+        worst = Some(worst.map_or(-h, |w| w.max(-h)));
+    }
+    worst
 }
 
 /// Courbe B(H) d'un matériau saturable, H en échelle logarithmique, avec le point de
@@ -526,7 +547,20 @@ impl App {
         };
         ui::note(ui, tr(text), t::FAINT);
 
-        ui::section(ui, "03", "CALCUL");
+        ui::section(ui, "03", "THERMIQUE");
+        ui::switch(ui, "Bilan thermique", &mut self.scene.thermal.enabled);
+        ui::kv_edit(ui, "Convection h", "W/(m²·K)", |ui| ui::number(ui, &mut self.scene.thermal.convection, Quantity::Count, 0.5, 1));
+        self.scene.thermal.convection = self.scene.thermal.convection.clamp(0.0, 1e4);
+        ui::segmented(ui, "Accélération", "thermal-speed", &mut self.scene.thermal.speed, &[(1.0, "×1"), (10.0, "×10"), (100.0, "×100")]);
+        ui::note(
+            ui,
+            tr(
+                "Pendant la lecture, chaque objet échange de la chaleur avec l’air (convection et rayonnement) et les bobines chauffent par effet Joule. Un objet à « température imposée » garde la sienne.",
+            ),
+            t::FAINT,
+        );
+
+        ui::section(ui, "04", "CALCUL");
         let mut gpu = self.use_gpu;
         if ui::segmented(ui, "Moteur", "engine", &mut gpu, &[(true, "GPU f32"), (false, "CPU f64")]) {
             self.set_solver(gpu);
@@ -536,8 +570,9 @@ impl App {
         let shown = format!("{:.0}", self.n_lines);
         ui::slider(ui, "Lignes", 44.0, &mut self.n_lines, 8.0..=160.0, Some(shown), true);
         self.n_lines = self.n_lines.round();
+        ui::switch(ui, "Désaimantation des aimants", &mut self.scene.demagnetization);
 
-        ui::section(ui, "04", "AFFICHAGE");
+        ui::section(ui, "05", "AFFICHAGE");
         ui::switch(ui, "Animer la LIC", &mut self.lic_animate);
         let clear = [("Effacer les graines", !self.scene.seeds.is_empty()), ("Balayer la limaille", !self.visuals.filings.is_empty())];
         match ui::button_row(ui, "clear", &clear) {
@@ -546,7 +581,7 @@ impl App {
             None => {}
         }
 
-        ui::section(ui, "05", "COMPARAISON");
+        ui::section(ui, "06", "COMPARAISON");
         if ui::accent_button(ui, "Figer l’état actuel comme référence", &self.icons.arrow) {
             self.freeze_reference();
         }
@@ -567,6 +602,10 @@ impl App {
         let motion = self.sim.world().and_then(|w| w.motion(id));
         let wrench = self.wrenches.iter().find(|w| w.id == id).copied();
         let mat = self.scene.get(id).and_then(|o| self.scene.material(&o.material)).cloned();
+        let (thermal, demagnetization) = (self.scene.thermal, self.scene.demagnetization);
+        let (tau, resistance) = self.scene.get(id).map_or((0.0, None), |o| (self.scene.time_constant(o), self.scene.resistance(o)));
+        let reverse = self.scene.get(id).zip(mat.as_ref()).and_then(|(o, m)| reverse_field(self.solver.field(), o, m, !demagnetization));
+        let mut import_bh = false;
         let focus_angle = std::mem::take(&mut self.focus_angle);
         let mut count = 0;
         let mut next = move || {
@@ -591,6 +630,10 @@ impl App {
         });
         let kelvin = format!("°C · {} K", fr(o.temperature - ABSOLUTE_ZERO_C, 2));
         ui::kv_edit(ui, "Température", &kelvin, |ui| ui::number(ui, &mut o.temperature, Quantity::Temperature, 1.0, 0));
+        ui::switch(ui, "Température imposée", &mut o.thermostat);
+        if thermal.enabled && !o.thermostat && tau > 0.0 {
+            ui::kv(ui, "Constante de temps thermique", &fr(tau / thermal.speed, 0), "s");
+        }
         if !o.visible {
             ui::note(ui, tr("Objet masqué : il est retiré du calcul."), t::WARN);
         }
@@ -642,19 +685,91 @@ impl App {
         ui::section(ui, &next(), title);
         match mat.class {
             MagClass::Magnet => {
-                let angle = ui::kv_edit(ui, "Angle", "°", |ui| ui::number(ui, &mut o.mag_angle, Quantity::Angle, 1.0, 0));
-                if focus_angle {
-                    angle.request_focus();
+                // Motif d'aimantation : les formes rondes suivent l'angle polaire, les autres leur longueur.
+                let round = o.magnetization().is_round();
+                let label = |pattern: &MagPattern| match pattern {
+                    MagPattern::Uniform if round => "Diamétrale",
+                    MagPattern::Uniform => "Uniforme",
+                    MagPattern::Radial => "Radiale",
+                    MagPattern::Multipole { .. } => "Multipolaire",
+                    MagPattern::Halbach { .. } => "Halbach",
+                    MagPattern::Painted => "Peinte",
+                };
+                let halbach = MagPattern::Halbach { pairs: if round { 1 } else { 2 }, flip: false };
+                let kinds = [MagPattern::Uniform, MagPattern::Radial, MagPattern::Multipole { pairs: 2 }, halbach, MagPattern::Painted];
+                ui::kv_edit(ui, "Motif", "", |ui| {
+                    let shown = egui::RichText::new(tr(label(&o.pattern))).font(mono(11.5)).color(t::TEXT_HI);
+                    egui::ComboBox::from_id_salt("pattern").width(184.0).selected_text(shown).show_ui(ui, |ui| {
+                        for kind in kinds {
+                            let on = std::mem::discriminant(&kind) == std::mem::discriminant(&o.pattern);
+                            if ui.selectable_label(on, tr(label(&kind))).clicked() && !on {
+                                if kind == MagPattern::Painted {
+                                    // Le motif peint part des directions du motif qu'il remplace.
+                                    o.painted();
+                                } else {
+                                    (o.pattern, o.paint) = (kind, None);
+                                }
+                            }
+                        }
+                    });
+                });
+                if o.pattern != MagPattern::Painted {
+                    let angle = ui::kv_edit(ui, "Angle", "°", |ui| ui::number(ui, &mut o.mag_angle, Quantity::Angle, 1.0, 0));
+                    if focus_angle {
+                        angle.request_focus();
+                    }
+                }
+                if let MagPattern::Multipole { pairs } | MagPattern::Halbach { pairs, .. } = &mut o.pattern {
+                    let mut value = *pairs as f64;
+                    let shown = pairs.to_string();
+                    ui::slider(ui, "Paires de pôles", 110.0, &mut value, 1.0..=12.0, Some(shown), true);
+                    *pairs = value.round().clamp(1.0, 12.0) as u32;
+                }
+                if let MagPattern::Halbach { flip, .. } = &mut o.pattern {
+                    let sides = if round { [tr("Intérieur"), tr("Extérieur")] } else { [tr("Dessus"), tr("Dessous")] };
+                    ui::segmented(ui, "Côté fort", "halbach-side", flip, &[(false, sides[0]), (true, sides[1])]);
+                }
+                if o.pattern == MagPattern::Painted {
+                    ui::note(ui, tr("Glissez le pinceau (N) sur l’aimant : l’aimantation suit le geste."), t::ACCENT);
                 }
                 if ui::button_row(ui, "flip", &[("Inverser les pôles", true)]).is_some() {
-                    o.mag_angle += std::f64::consts::PI;
+                    match (o.pattern, &mut o.paint) {
+                        (MagPattern::Painted, Some(lattice)) => lattice.values.iter_mut().for_each(|a| *a += std::f32::consts::PI),
+                        _ => o.mag_angle += std::f64::consts::PI,
+                    }
                 }
                 for (label, tesla) in [("Br à 20 °C", mat.br), ("Br à la température de l’objet", mat.br_at(o.temperature))] {
                     let (br, unit) = units::remanence(tesla);
                     ui::kv(ui, label, &fr(br, 3), unit);
                 }
                 ui::kv(ui, "μrec", &fr(mat.mu_r, 2), "");
+                if mat.hcj > 0.0 {
+                    let (value, unit) = units::coercivity(mat.hcj_at(o.temperature));
+                    ui::kv(ui, "HcJ à la température de l’objet", &value, unit);
+                }
+                if mat.t_max > 0.0 {
+                    let color = if o.temperature > mat.t_max { t::WARN } else { t::TEXT_HI };
+                    ui::kv_colored(ui, "T max d’emploi", &fr(mat.t_max, 0), "°C", color);
+                }
                 ui::kv(ui, "Tc", &fr(mat.t_curie, 0), "°C");
+                // Tenue à la désaimantation : champ inverse rapporté au coude de la courbe.
+                if mat.hcj > 0.0 && demagnetization {
+                    if let Some(h) = reverse {
+                        let ratio = (h / (KNEE * mat.hcj_at(o.temperature).max(1.0))).max(0.0);
+                        ui::gauge(ui, "Champ inverse / coude", ratio, 1.5, &format!("{} %", fr(100.0 * ratio, 0)), t::WARN);
+                    }
+                    let left = o.mean_remanence_left();
+                    ui::kv_colored(ui, "Rémanence restante", &fr(100.0 * left, 1), "%", if left < 0.995 { t::WARN } else { t::TEXT_HI });
+                    if o.demag.is_some() {
+                        if ui::button_row(ui, "remagnetize", &[("Ré-aimanter", true)]).is_some() {
+                            o.demag = None;
+                        }
+                        let text = "Désaimantation irréversible : le champ inverse a dépassé le coude de la courbe. L’aimant ne retrouve sa rémanence qu’une fois ré-aimanté.";
+                        ui::note(ui, tr(text), t::WARN);
+                    }
+                } else if mat.hcj > 0.0 {
+                    ui::note(ui, tr("Désaimantation ignorée : réglage « Désaimantation des aimants » de la scène."), t::FAINT);
+                }
             }
             MagClass::Ferro => {
                 match mat.curve_at(o.temperature) {
@@ -663,6 +778,11 @@ impl App {
                         ui::kv(ui, "μr initiale", &fr(curve.mu_r_initial(), 0), "");
                         let (value, unit) = units::remanence(js);
                         ui::kv(ui, "Js (saturation)", &fr(value, 2), unit);
+                        let factor = mat.js_factor(o.temperature);
+                        if factor != 1.0 {
+                            // Loi de Kuz'min : la saturation baisse à l'approche de Tc.
+                            ui::kv(ui, "Js(T) / Js de référence", &fr(100.0 * factor, 1), "%");
+                        }
                         if let Some(b) = inside {
                             ui::kv(ui, "B dans l’objet", &units::b(b), "");
                             ui::kv(ui, "μr effective", &fr(1.0 / table.eval(b).0, 0), "");
@@ -670,9 +790,18 @@ impl App {
                         }
                         bh_plot(ui, &table, js, inside);
                     }
-                    None => ui::kv(ui, "μr (linéaire)", &fr(mat.mu_r_solver(o.temperature), 0), ""),
+                    None if mat.is_ferromagnetic(o.temperature) => ui::kv(ui, "μr (linéaire)", &fr(mat.mu_r_solver(o.temperature), 0), ""),
+                    None => {
+                        ui::kv_colored(ui, "État", tr("paramagnétique"), "", t::WARN);
+                        ui::kv(ui, "χ (Curie–Weiss)", &format!("{:+.2e}", units::susceptibility(mat.chi_at(o.temperature))), "");
+                        let text = "Au-dessus de sa température de Curie, le matériau n’est plus que paramagnétique : χ = C / (T − Tc).";
+                        ui::note(ui, tr(text), t::WARN);
+                    }
                 }
                 ui::kv(ui, "Tc", &fr(mat.t_curie, 0), "°C");
+                if ui::button_row(ui, "bh", &[("Importer une courbe B(H)…", true)]).is_some() {
+                    import_bh = true;
+                }
             }
             MagClass::Conductor => {
                 ui::kv_edit(ui, "Spires", "", |ui| ui::number(ui, &mut o.turns, Quantity::Count, 1.0, 0));
@@ -686,10 +815,28 @@ impl App {
                 let j = o.amp_turns().abs() / area * 1e-6;
                 // Au-delà d'environ 5 A/mm² en continu, le bobinage chauffe.
                 ui::kv_colored(ui, "Densité J", &fr(j, 2), "A/mm²", if j > 5.0 { t::WARN } else { t::TEXT_HI });
+                if o.turns > 1.0 {
+                    ui::kv_edit(ui, "Remplissage", "", |ui| ui::number(ui, &mut o.fill, Quantity::Count, 0.01, 2));
+                    o.fill = o.fill.clamp(0.05, 1.0);
+                }
+                if let Some(r) = resistance {
+                    // ρ(T) = ρ20·[1 + 0,00393·(T − 20)] : la bobine résiste davantage en chauffant.
+                    ui::kv(ui, "Résistivité", &fr(mat.resistivity_at(o.temperature) * 1e9, 2), "nΩ·m");
+                    ui::kv(ui, "Résistance", &units::number(r * 1e3), "mΩ");
+                    ui::kv(ui, "Tension", &units::number(r * o.current.abs()), "V");
+                    ui::kv(ui, "Puissance Joule", &units::number(r * o.current * o.current), "W");
+                }
             }
             MagClass::Para | MagClass::Dia => {
                 let chi = mat.chi_at(o.temperature);
-                ui::kv(ui, "χ", &format!("{:+.2e}", units::susceptibility(chi)), "");
+                match mat.weak_chi(o.temperature) {
+                    Some([perp, par]) if perp != par => {
+                        ui::kv(ui, "χ en travers des feuillets", &format!("{:+.2e}", units::susceptibility(perp)), "");
+                        ui::kv(ui, "χ le long des feuillets", &format!("{:+.2e}", units::susceptibility(par)), "");
+                        ui::note(ui, tr("Matériau anisotrope : ses feuillets suivent la largeur de l’objet (axe X local)."), t::FAINT);
+                    }
+                    _ => ui::kv(ui, "χ", &format!("{:+.2e}", units::susceptibility(chi)), ""),
+                }
                 let text = format!(
                     "{} {} % {}",
                     tr("Modifie le champ d’environ"),
@@ -739,16 +886,18 @@ impl App {
             let center = o.pos.truncate();
             let kinds = [Link::Free, Link::Pivot { anchor: DVec2::ZERO }, Link::Slider { angle: 0.0 }];
             let spring = Link::Spring { anchor: center + DVec2::new(0.0, 0.03), stiffness: 50.0, damping: 0.05, length: 0.03 };
+            let rope = Link::Rope { anchor: center + DVec2::new(0.0, 0.05), length: 0.05 };
             let name = |link: &Link| match link {
                 Link::Free => "Libre",
                 Link::Pivot { .. } => "Pivot",
                 Link::Slider { .. } => "Glissière",
                 Link::Spring { .. } => "Ressort",
+                Link::Rope { .. } => "Fil (pendule)",
             };
             ui::kv_edit(ui, "Liaison", "", |ui| {
                 let shown = egui::RichText::new(tr(name(&o.body.link))).font(mono(11.5)).color(t::TEXT_HI);
                 egui::ComboBox::from_id_salt("link").width(184.0).selected_text(shown).show_ui(ui, |ui| {
-                    for kind in kinds.into_iter().chain([spring]) {
+                    for kind in kinds.into_iter().chain([spring, rope]) {
                         let on = std::mem::discriminant(&kind) == std::mem::discriminant(&o.body.link);
                         if ui.selectable_label(on, tr(name(&kind))).clicked() && !on {
                             o.body.link = kind;
@@ -775,6 +924,12 @@ impl App {
                     ui::kv_edit(ui, "Amortissement", "N·s/m", |ui| ui::number(ui, damping, Quantity::Count, 0.01, 3));
                     length(ui, "Longueur au repos", rest);
                     (*stiffness, *damping, *rest) = (stiffness.max(0.0), damping.max(0.0), rest.max(0.0));
+                }
+                Link::Rope { anchor, length: rest } => {
+                    length(ui, "Ancrage X", &mut anchor.x);
+                    length(ui, "Ancrage Y", &mut anchor.y);
+                    length(ui, "Longueur du fil", rest);
+                    *rest = rest.max(1e-4);
                 }
             }
             if let Some(m) = motion {
@@ -848,6 +1003,9 @@ impl App {
         }
         if std::mem::take(&mut self.reveal_boolean) {
             ui.scroll_to_rect(head.with_max_y(head.bottom() + 66.0), Some(Align::BOTTOM));
+        }
+        if import_bh {
+            self.import_bh(&mat.name);
         }
     }
 
