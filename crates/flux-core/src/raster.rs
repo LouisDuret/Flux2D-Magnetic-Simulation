@@ -5,10 +5,12 @@
 //! renormalisées pour rester exactes quelle que soit la position sur la grille.
 
 use crate::MU0;
-use crate::material::MagClass;
+use crate::material::{MagClass, NuTable};
 use crate::scene::Scene;
 use crate::shape::Sdf;
 use glam::DVec3;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub struct RasterizedScene {
     /// Cellules par côté (puissance de deux).
@@ -23,6 +25,60 @@ pub struct RasterizedScene {
     /// ν_r·Br (T), composantes x et y.
     pub mx: Vec<f32>,
     pub my: Vec<f32>,
+    /// Matériaux saturables (section 3.6) ; `None` si la scène est linéaire.
+    pub nonlinear: Option<Nonlinear>,
+    /// Cellules où un courant ou une aimantation peut être non nul.
+    sources: Vec<u32>,
+}
+
+/// Cellule contenant un matériau saturable.
+#[derive(Clone, Copy, Debug)]
+pub struct NlCell {
+    pub cell: u32,
+    /// Indice de sa courbe dans `Nonlinear::curves`.
+    pub curve: u16,
+    /// Fraction de la cellule occupée par ce matériau.
+    pub weight: f32,
+    /// Réluctivité relative apportée par le reste de la cellule.
+    pub base: f32,
+}
+
+/// Données de l'itération de Newton : `nu_r` est la réluctivité sécante ν(B) au potentiel de
+/// linéarisation, et la jacobienne lui ajoute par cellule le terme κ·ĝ·ĝᵀ, où g = K⁰·a.
+pub struct Nonlinear {
+    pub curves: Vec<Arc<NuTable>>,
+    pub cells: Vec<NlCell>,
+    /// Coefficient κ du terme tangent, par cellule (nul hors des cellules saturables).
+    pub kappa: Vec<f32>,
+    /// Potentiel de linéarisation aux nœuds.
+    pub lin_a: Vec<f32>,
+}
+
+/// Valeurs nodales d'une cellule (nœuds (0,0), (1,0), (0,1), (1,1)) et g = K⁰·a, où K⁰ est la
+/// matrice de raideur Q1 d'une cellule carrée. Alors a·g = h²·⟨B²⟩ sur la cellule.
+#[inline]
+pub fn element(a: &[f32], n: usize, cell: usize) -> ([f64; 4], [f64; 4]) {
+    let k = cell / n * (n + 1) + cell % n;
+    let v = [a[k] as f64, a[k + 1] as f64, a[k + n + 1] as f64, a[k + n + 2] as f64];
+    (v, stiffness(&v))
+}
+
+/// K⁰·v : matrice de raideur Q1 d'une cellule carrée appliquée à ses valeurs nodales.
+#[inline]
+pub fn stiffness(v: &[f64; 4]) -> [f64; 4] {
+    [
+        (4.0 * v[0] - v[1] - v[2] - 2.0 * v[3]) / 6.0,
+        (4.0 * v[1] - v[0] - v[3] - 2.0 * v[2]) / 6.0,
+        (4.0 * v[2] - v[0] - v[3] - 2.0 * v[1]) / 6.0,
+        (4.0 * v[3] - v[1] - v[2] - 2.0 * v[0]) / 6.0,
+    ]
+}
+
+/// Indices des quatre nœuds d'une cellule, dans l'ordre de `element`.
+#[inline]
+pub fn element_nodes(n: usize, cell: usize) -> [usize; 4] {
+    let k = cell / n * (n + 1) + cell % n;
+    [k, k + 1, k + n + 1, k + n + 2]
 }
 
 impl RasterizedScene {
@@ -31,25 +87,44 @@ impl RasterizedScene {
         DVec3::new(o + (ci as f64 + 0.5) * self.h, o + (cj as f64 + 0.5) * self.h, 0.0)
     }
 
-    /// Second membre aux nœuds du système normalisé −∇·(ν_r ∇A) = μ0 J + rot(ν_r Br).
+    /// Second membre du système linéarisé : sources, plus le terme tangent de Newton appliqué
+    /// au potentiel de linéarisation.
     pub fn rhs(&self) -> Vec<f64> {
+        let mut b = self.sources();
+        if let Some(nl) = &self.nonlinear {
+            for c in &nl.cells {
+                let kappa = nl.kappa[c.cell as usize] as f64;
+                let (v, g) = element(&nl.lin_a, self.n, c.cell as usize);
+                let gg: f64 = g.iter().map(|x| x * x).sum();
+                if kappa == 0.0 || gg == 0.0 {
+                    continue;
+                }
+                let scale = kappa * (0..4).map(|i| g[i] * v[i]).sum::<f64>() / gg;
+                for (node, gi) in element_nodes(self.n, c.cell as usize).into_iter().zip(g) {
+                    b[node] += scale * gi;
+                }
+            }
+        }
+        b
+    }
+
+    /// Second membre aux nœuds du système normalisé −∇·(ν_r ∇A) = μ0 J + rot(ν_r Br).
+    pub fn sources(&self) -> Vec<f64> {
         let (n, h) = (self.n, self.h);
         let m = n + 1;
         let mut b = vec![0.0; m * m];
-        for cj in 0..n {
-            for ci in 0..n {
-                let c = cj * n + ci;
-                let (j, mx, my) = (self.jz[c] as f64, self.mx[c] as f64, self.my[c] as f64);
-                if j == 0.0 && mx == 0.0 && my == 0.0 {
-                    continue;
-                }
-                let src = MU0 * j * h * h / 4.0;
-                for (a, bb) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    // ∫∂v/∂x = ±h/2 selon que le nœud est à droite ou à gauche de la cellule.
-                    let sx = if a == 1 { 1.0 } else { -1.0 };
-                    let sy = if bb == 1 { 1.0 } else { -1.0 };
-                    b[(cj + bb) * m + ci + a] += src + h / 2.0 * (sy * mx - sx * my);
-                }
+        for &c in &self.sources {
+            let (ci, cj, c) = (c as usize % n, c as usize / n, c as usize);
+            let (j, mx, my) = (self.jz[c] as f64, self.mx[c] as f64, self.my[c] as f64);
+            if j == 0.0 && mx == 0.0 && my == 0.0 {
+                continue;
+            }
+            let src = MU0 * j * h * h / 4.0;
+            for (a, bb) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                // ∫∂v/∂x = ±h/2 selon que le nœud est à droite ou à gauche de la cellule.
+                let sx = if a == 1 { 1.0 } else { -1.0 };
+                let sy = if bb == 1 { 1.0 } else { -1.0 };
+                b[(cj + bb) * m + ci + a] += src + h / 2.0 * (sy * mx - sx * my);
             }
         }
         b
@@ -79,8 +154,21 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
     assert!(n.is_power_of_two() && n >= 4);
     let size = scene.size;
     let h = size / n as f64;
-    let mut r = RasterizedScene { n, size, h, nu_r: vec![1.0; n * n], jz: vec![0.0; n * n], mx: vec![0.0; n * n], my: vec![0.0; n * n] };
+    let mut r = RasterizedScene {
+        n,
+        size,
+        h,
+        nu_r: vec![1.0; n * n],
+        jz: vec![0.0; n * n],
+        mx: vec![0.0; n * n],
+        my: vec![0.0; n * n],
+        nonlinear: None,
+        sources: Vec::new(),
+    };
     let mut cover: Vec<(usize, f64)> = Vec::new();
+    // Matériaux saturables : courbes par nom de matériau et, par cellule, (courbe, fraction, reste).
+    let mut curves: Vec<(&str, Arc<NuTable>)> = Vec::new();
+    let mut saturable: BTreeMap<usize, (u16, f32, f32)> = BTreeMap::new();
     for obj in scene.objects.iter().filter(|o| o.visible) {
         let Some(mat) = scene.material(&obj.material) else { continue };
         // Boîte englobante en indices de cellules.
@@ -101,23 +189,50 @@ pub fn rasterize(scene: &Scene, n: usize) -> RasterizedScene {
         if area == 0.0 {
             continue;
         }
-        let nu = 1.0 / mat.mu_r_solver(obj.temperature);
+        let curve = mat.curve_at(obj.temperature).map(|bh| {
+            let k = curves.iter().position(|(name, _)| *name == mat.name).unwrap_or_else(|| {
+                curves.push((&mat.name, bh.table()));
+                curves.len() - 1
+            });
+            k as u16
+        });
+        // Un matériau saturable part de sa réluctivité à champ nul.
+        let nu = curve.map_or(1.0 / mat.mu_r_solver(obj.temperature), |k| curves[k as usize].1.eval(0.0).0);
         let jz = obj.amp_turns() / area;
         let m = if mat.class == MagClass::Magnet {
             obj.mag_dir() * (nu * mat.br_at(obj.temperature) * obj.shape.area() / area)
         } else {
             glam::DVec2::ZERO
         };
+        if jz != 0.0 || m != glam::DVec2::ZERO {
+            r.sources.extend(cover.iter().map(|&(c, _)| c as u32));
+        }
         for &(c, f) in &cover {
             let keep = 1.0 - f;
             // Le flux traverse la surface du fer (réluctances en série : moyenne de ν) mais
             // longe celle d'un supraconducteur (en parallèle : moyenne de μ).
             let old = r.nu_r[c] as f64;
             r.nu_r[c] = (if nu > 1.0 { 1.0 / (keep / old + f / nu) } else { old * keep + nu * f }) as f32;
+            if let Some(k) = curve {
+                saturable.insert(c, (k, f as f32, (old * keep) as f32));
+            } else if nu > 1.0 {
+                saturable.remove(&c);
+            } else if let Some(entry) = saturable.get_mut(&c) {
+                // Un objet linéaire recouvre en partie un matériau saturable déjà posé.
+                *entry = (entry.0, entry.1 * keep as f32, (entry.2 as f64 * keep + nu * f) as f32);
+            }
             r.jz[c] = (r.jz[c] as f64 * keep + jz * f) as f32;
             r.mx[c] = (r.mx[c] as f64 * keep + m.x * f) as f32;
             r.my[c] = (r.my[c] as f64 * keep + m.y * f) as f32;
         }
+    }
+    let cells: Vec<NlCell> =
+        saturable.iter().filter(|(_, e)| e.1 > 0.0).map(|(c, e)| NlCell { cell: *c as u32, curve: e.0, weight: e.1, base: e.2 }).collect();
+    r.sources.sort_unstable();
+    r.sources.dedup();
+    if !cells.is_empty() {
+        let curves = curves.into_iter().map(|(_, table)| table).collect();
+        r.nonlinear = Some(Nonlinear { curves, cells, kappa: vec![0.0; n * n], lin_a: vec![0.0; (n + 1) * (n + 1)] });
     }
     r
 }

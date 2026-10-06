@@ -7,6 +7,7 @@ use crate::ui::{self, PAD};
 use crate::units::Units;
 use eframe::egui::{self, Align2, Key, Modifiers, Rect, Sense, Stroke, Vec2, pos2, vec2};
 use flux_core::DVec2;
+use flux_core::scene::MechView;
 
 /// État de la palette ouverte : texte recherché et ligne en surbrillance.
 #[derive(Default)]
@@ -42,6 +43,10 @@ enum Command {
     ClearFilings,
     ClearCut,
     Freeze,
+    Play,
+    Step,
+    Rewind,
+    View(MechView),
 }
 
 /// Texte en minuscules sans accents, pour une recherche tolérante.
@@ -102,6 +107,11 @@ impl App {
             ("Balayer la limaille", "", Command::ClearFilings),
             ("Effacer la ligne de coupe", "", Command::ClearCut),
             ("Figer l’état actuel comme référence", "", Command::Freeze),
+            ("Lecture ou pause de la simulation", "Espace", Command::Play),
+            ("Avancer la simulation d’un pas", ".", Command::Step),
+            ("Revenir à l’état initial", "", Command::Rewind),
+            ("Vue de dessus (table)", "", Command::View(MechView::Top)),
+            ("Vue de côté (pesanteur dans le plan)", "", Command::View(MechView::Side)),
         ];
         list.extend(simple.map(|(label, key, command)| (tr(label).to_owned(), key, command)));
         list
@@ -145,6 +155,10 @@ impl App {
             Command::ClearFilings => self.visuals.filings.clear(),
             Command::ClearCut => self.scene.cut_line = None,
             Command::Freeze => self.freeze_reference(),
+            Command::Play => self.toggle_play(),
+            Command::Step => self.step_simulation(),
+            Command::Rewind => self.rewind(),
+            Command::View(view) => self.scene.mechanics.view = view,
         }
     }
 
@@ -225,7 +239,7 @@ impl App {
                             );
                             // Seuls les noms de touches propres au français changent avec la langue.
                             let key = match *key {
-                                "Ctrl Maj Z" | "Suppr" => tr(key),
+                                "Ctrl Maj Z" | "Suppr" | "Espace" => tr(key),
                                 key => key,
                             };
                             p.text(

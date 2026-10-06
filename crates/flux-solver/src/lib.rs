@@ -7,10 +7,12 @@
 
 pub mod cpu;
 pub mod gpu;
+pub mod nonlinear;
 pub mod post;
 
 pub use cpu::Cpu64Reference;
 pub use gpu::Planar2DGpu;
+pub use nonlinear::Newton;
 pub use post::{Field, FieldSample, Wrench, forces};
 
 use flux_core::raster::RasterizedScene;
@@ -52,15 +54,37 @@ pub(crate) fn nu_hierarchy(n: usize, nu: &[f32]) -> Vec<(usize, Vec<f64>)> {
     let mut levels = vec![(n, nu.iter().map(|&v| v as f64).collect::<Vec<f64>>())];
     while levels.last().unwrap().0 > COARSEST_N {
         let (nf, fine) = levels.last().unwrap();
-        let nc = nf / 2;
-        let mut coarse = vec![0.0; nc * nc];
-        for cj in 0..nc {
-            for ci in 0..nc {
-                let k = 2 * cj * nf + 2 * ci;
-                coarse[cj * nc + ci] = 0.25 * (fine[k] + fine[k + 1] + fine[k + nf] + fine[k + nf + 1]);
-            }
-        }
-        levels.push((nc, coarse));
+        levels.push((nf / 2, coarsen(*nf, fine)));
     }
     levels
+}
+
+/// Niveaux grossiers de la hiérarchie (le niveau fin est `nu` lui-même), en simple précision.
+pub(crate) fn coarse_levels(n: usize, nu: &[f32]) -> Vec<Vec<f32>> {
+    let mut levels: Vec<Vec<f32>> = Vec::new();
+    let mut nf = n;
+    while nf > COARSEST_N {
+        let coarse = coarsen(nf, levels.last().map_or(nu, Vec::as_slice));
+        levels.push(coarse);
+        nf /= 2;
+    }
+    levels
+}
+
+/// Moyenne 2×2 des cellules d'un niveau de `nf` cellules de côté.
+fn coarsen<T>(nf: usize, fine: &[T]) -> Vec<T>
+where
+    T: Copy + Send + Sync + std::ops::Add<Output = T> + std::ops::Mul<Output = T> + From<f32>,
+{
+    use rayon::prelude::*;
+    let nc = nf / 2;
+    let quarter = T::from(0.25);
+    let mut coarse = vec![quarter; nc * nc];
+    coarse.par_chunks_mut(nc).enumerate().for_each(|(cj, row)| {
+        for (ci, out) in row.iter_mut().enumerate() {
+            let k = 2 * cj * nf + 2 * ci;
+            *out = quarter * (fine[k] + fine[k + 1] + fine[k + nf] + fine[k + nf + 1]);
+        }
+    });
+    coarse
 }

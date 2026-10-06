@@ -6,7 +6,80 @@ use crate::shape::{BoolOp, Contour, Sdf, Shape, boolean};
 use glam::{DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Vue mécanique de la scène (section 2.7).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MechView {
+    /// Vue de dessus : les objets reposent sur une table, la gravité est perpendiculaire au plan.
+    #[default]
+    Top,
+    /// Vue de côté : la gravité est dans le plan, vers le bas.
+    Side,
+}
+
+/// Réglages mécaniques de la scène.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Mechanics {
+    pub view: MechView,
+    /// Accélération de la pesanteur (m/s²).
+    pub gravity: f64,
+}
+
+impl Default for Mechanics {
+    fn default() -> Self {
+        Mechanics { view: MechView::Top, gravity: 9.81 }
+    }
+}
+
+/// Liaison d'un objet mobile avec le support.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+pub enum Link {
+    #[default]
+    Free,
+    /// Pivot : le point `anchor` de l'objet (repère local) est épinglé au support.
+    Pivot { anchor: DVec2 },
+    /// Glissière : translation le long de l'axe d'angle `angle` (rad, repère monde), sans rotation.
+    Slider { angle: f64 },
+    /// Ressort et amortisseur entre le centre de l'objet et le point fixe `anchor` (repère
+    /// monde) : raideur en N/m, amortissement en N·s/m, longueur au repos en m.
+    Spring { anchor: DVec2, stiffness: f64, damping: f64, length: f64 },
+}
+
+/// Couples de matériaux à sec (section 6.5) : nom, μs, μk.
+pub const SURFACES: [(&str, f64, f64); 10] = [
+    ("Acier / acier", 0.74, 0.57),
+    ("Aluminium / acier", 0.61, 0.47),
+    ("Cuivre / acier", 0.53, 0.36),
+    ("Verre / verre", 0.94, 0.40),
+    ("Bois / bois", 0.40, 0.20),
+    ("PTFE / acier", 0.04, 0.04),
+    ("Caoutchouc / béton", 1.0, 0.8),
+    ("Glace / glace", 0.10, 0.03),
+    ("Coussin d'air", 0.0, 0.001),
+    // Résistance au roulement d'une bille ou d'un cylindre.
+    ("Roulement acier / acier", 0.001, 0.001),
+];
+
+/// Comportement mécanique d'un objet.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Body {
+    /// Un objet fixe sert d'obstacle ; un objet mobile obéit aux forces.
+    pub mobile: bool,
+    /// Coefficient de frottement statique.
+    pub mu_s: f64,
+    /// Coefficient de frottement dynamique.
+    pub mu_k: f64,
+    pub link: Link,
+}
+
+impl Default for Body {
+    fn default() -> Self {
+        Body { mobile: false, mu_s: 0.40, mu_k: 0.20, link: Link::Free }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Object {
@@ -35,6 +108,8 @@ pub struct Object {
     /// Un objet verrouillé ne se déplace, ne se tourne et ne se supprime pas sur le canevas.
     #[serde(default)]
     pub locked: bool,
+    #[serde(default)]
+    pub body: Body,
 }
 
 fn yes() -> bool {
@@ -92,6 +167,8 @@ pub struct Scene {
     pub seeds: Vec<DVec3>,
     #[serde(default)]
     pub cut_line: Option<[DVec3; 2]>,
+    #[serde(default)]
+    pub mechanics: Mechanics,
     next_id: u32,
 }
 
@@ -108,6 +185,7 @@ impl Default for Scene {
             probes: Vec::new(),
             seeds: Vec::new(),
             cut_line: None,
+            mechanics: Mechanics::default(),
             next_id: 1,
         }
     }
@@ -116,6 +194,11 @@ impl Default for Scene {
 impl Scene {
     pub fn material(&self, name: &str) -> Option<&Material> {
         self.materials.iter().find(|m| m.name == name)
+    }
+
+    /// Masse d'un objet (kg) : ρ·S·profondeur.
+    pub fn mass(&self, obj: &Object) -> f64 {
+        self.material(&obj.material).map_or(0.0, |m| m.density) * obj.shape.area() * self.depth
     }
 
     /// Ajoute un objet et renvoie son identifiant.
@@ -135,6 +218,7 @@ impl Scene {
             temperature: self.ambient,
             visible: true,
             locked: false,
+            body: Body::default(),
         });
         id
     }
@@ -214,6 +298,15 @@ impl Scene {
         if scene.schema_version > SCHEMA_VERSION {
             return Err(format!("version de schéma {} non prise en charge", scene.schema_version));
         }
+        if scene.schema_version < 2 {
+            // Avant la version 2, les ferromagnétiques n'avaient pas de courbe B(H) : ceux de la
+            // bibliothèque reçoivent la leur.
+            let lib = library();
+            for m in scene.materials.iter_mut().filter(|m| m.bh.is_none()) {
+                m.bh = lib.iter().find(|l| l.name == m.name && l.class == m.class).and_then(|l| l.bh.clone());
+            }
+            scene.schema_version = SCHEMA_VERSION;
+        }
         Ok(scene)
     }
 
@@ -226,6 +319,26 @@ impl Scene {
         let supra = s.add("Supra", Shape::Circle { r: 0.008 }, DVec2::new(-0.010, 0.012), "YBCO");
         s.get_mut(supra).unwrap().temperature = -196.0;
         s.add("Graphite", Shape::Rect { w: 0.016, h: 0.003 }, DVec2::new(0.022, 0.004), "Graphite pyrolytique");
+        s
+    }
+
+    /// Exemple chiffré de la section 2.7 : la plaque de fer, posée sur une table, se précipite
+    /// vers l'aimant si le frottement est faible.
+    pub fn friction_demo() -> Scene {
+        let mut s = Scene { name: "Plaque attirée sur une table".into(), ..Scene::demo() };
+        let plate = &mut s.objects[1];
+        plate.pos.x = 0.030;
+        // Bois sur bois : la force vaut ici près de trois fois le seuil μs·m·g.
+        plate.body = Body { mobile: true, ..Body::default() };
+        s
+    }
+
+    /// Une tôle mince devant un aimant puissant : le fer sature et laisse fuir le champ.
+    pub fn saturation_demo() -> Scene {
+        let mut s = Scene { name: "Tôle saturée".into(), ..Scene::default() };
+        let magnet = s.add("Aimant", Shape::Rect { w: 0.030, h: 0.020 }, DVec2::new(0.0, -0.013), "NdFeB N52");
+        s.get_mut(magnet).unwrap().mag_angle = std::f64::consts::FRAC_PI_2;
+        s.add("Tôle", Shape::Rect { w: 0.080, h: 0.002 }, DVec2::new(0.0, 0.0), "Acier doux (S235)");
         s
     }
 
@@ -279,6 +392,34 @@ mod tests {
         assert_eq!(s.boolean(magnet, far, BoolOp::Intersection), None);
         assert_eq!(s.objects.len(), 2);
         assert_eq!(Scene::from_ron(&s.to_ron().unwrap()).unwrap(), s);
+    }
+
+    /// Un fichier de la version 1 (sans mécanique ni courbe B(H)) reste lisible et gagne les
+    /// courbes de la bibliothèque.
+    #[test]
+    fn version_1_files_are_upgraded() {
+        let mut s = Scene::demo();
+        s.schema_version = 1;
+        s.materials.iter_mut().for_each(|m| m.bh = None);
+        // Les blocs « body: ( … ), » et « mechanics: ( … ), » sont retirés ligne à ligne.
+        let mut skipping = false;
+        let mut old = String::new();
+        for line in s.to_ron().unwrap().lines() {
+            let word = line.trim();
+            skipping |= word.starts_with("body: (") || word.starts_with("mechanics: (");
+            if !skipping {
+                old += line;
+                old.push('\n');
+            }
+            skipping &= word != "),";
+        }
+        assert!(!old.contains("body:") && !old.contains("mechanics:") && old.contains("next_id"));
+        let loaded = Scene::from_ron(&old).unwrap();
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert_eq!(loaded.objects[1].body, Body::default());
+        assert_eq!(loaded.mechanics, Mechanics::default());
+        assert!(loaded.material("Fer pur (Armco)").unwrap().bh.is_some());
+        assert!(loaded.material("NdFeB N42").unwrap().bh.is_none());
     }
 
     /// Un objet masqué est ignoré par la sélection, et un fichier sans ces champs reste lisible.

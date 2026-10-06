@@ -13,8 +13,8 @@ use eframe::egui::{self, Align2, Color32, CursorIcon, Painter, PointerButton, Po
 use eframe::egui_wgpu;
 use flux_core::DVec2;
 use flux_core::material::MagClass;
-use flux_core::scene::Object;
-use flux_core::shape::{Contour, PathNode, Sdf, Shape, flatten_path};
+use flux_core::scene::{Link, MechView, Object};
+use flux_core::shape::{PathNode, Sdf, Shape, flatten_path, trapezoids};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 /// Épaisseur des règles graduées.
@@ -50,35 +50,6 @@ fn clip_half(poly: &[DVec2], origin: DVec2, normal: DVec2) -> Vec<DVec2> {
         }
         if (da >= 0.0) != (db >= 0.0) {
             out.push(a + (b - a) * (da / (da - db)));
-        }
-    }
-    out
-}
-
-/// Découpe la région délimitée par des contours (règle pair-impair) en trapèzes à bases
-/// horizontales : de quoi remplir n'importe quelle forme, concave ou trouée.
-fn trapezoids(contours: &[Contour]) -> Vec<[DVec2; 4]> {
-    let mut ys: Vec<f64> = contours.iter().flatten().map(|p| p.y).collect();
-    ys.sort_by(f64::total_cmp);
-    ys.dedup();
-    let edges: Vec<(DVec2, DVec2)> =
-        contours.iter().flat_map(|c| (0..c.len()).map(move |i| (c[i], c[(i + 1) % c.len()]))).filter(|(a, b)| a.y != b.y).collect();
-    let mut out = Vec::new();
-    let mut xs: Vec<(f64, f64)> = Vec::new();
-    for band in ys.windows(2) {
-        let (y0, y1) = (band[0], band[1]);
-        let mid = (y0 + y1) / 2.0;
-        // Abscisses, en bas et en haut de la bande, des arêtes qui la traversent.
-        xs.clear();
-        for &(a, b) in &edges {
-            if (a.y > mid) != (b.y > mid) {
-                let x = |y: f64| a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x);
-                xs.push((x(y0), x(y1)));
-            }
-        }
-        xs.sort_by(|p, q| (p.0 + p.1).total_cmp(&(q.0 + q.1)));
-        for pair in xs.as_chunks::<2>().0 {
-            out.push([DVec2::new(pair[0].0, y0), DVec2::new(pair[1].0, y0), DVec2::new(pair[1].1, y1), DVec2::new(pair[0].1, y1)]);
         }
     }
     out
@@ -389,6 +360,8 @@ impl App {
             }
         }
 
+        self.draw_mechanics(&painter, view);
+
         let f_max = self.wrenches.iter().map(|w| w.force.length()).fold(1e-12, f64::max);
         for w in &self.wrenches {
             let Some(o) = self.scene.get(w.id).filter(|o| o.visible) else { continue };
@@ -462,6 +435,74 @@ impl App {
         if self.show_ui {
             self.rulers(&full_painter, resp.rect, view, hover);
             self.overlays(ui, &painter, view);
+        }
+    }
+
+    /// Supports et liaisons : bord du domaine (murs, et sol en vue de côté), pivots,
+    /// glissières et ressorts des objets mobiles.
+    fn draw_mechanics(&self, p: &Painter, view: View) {
+        let mobile: Vec<&Object> = self.scene.objects.iter().filter(|o| o.visible && o.body.mobile).collect();
+        if mobile.is_empty() {
+            return;
+        }
+        let half = self.scene.size / 2.0;
+        let walls = Rect::from_two_pos(view.to_screen(DVec2::splat(-half)), view.to_screen(DVec2::splat(half)));
+        p.rect_stroke(walls, 0.0, Stroke::new(1.0, t::TICK_MAJOR), egui::StrokeKind::Outside);
+        if self.scene.mechanics.view == MechView::Side {
+            // Sol hachuré.
+            p.hline(walls.x_range(), walls.bottom(), Stroke::new(2.0, t::TEXT_MID));
+            let mut x = walls.left().max(view.rect.left() - 12.0);
+            while x < walls.right().min(view.rect.right() + 12.0) {
+                p.line_segment([pos2(x + 8.0, walls.bottom()), pos2(x, walls.bottom() + 8.0)], Stroke::new(1.0, t::TICK_MAJOR));
+                x += 10.0;
+            }
+        }
+        let line = Stroke::new(1.4, t::TEXT_HI);
+        // Chaque trait est doublé d'un liseré sombre : il reste lisible sur les lignes de champ.
+        let halo = Stroke::new(4.0, t::BG);
+        let anchor_mark = |at: Pos2| {
+            let r = Rect::from_center_size(at, Vec2::splat(7.0));
+            p.rect_filled(r.expand(1.5), 0.0, t::BG);
+            p.rect_stroke(r, 0.0, line, egui::StrokeKind::Middle);
+        };
+        for o in mobile {
+            let center = o.pos.truncate();
+            match o.body.link {
+                Link::Free => {}
+                Link::Pivot { anchor } => {
+                    let at = view.to_screen(o.to_world(anchor));
+                    p.circle_filled(at, 6.5, t::BG);
+                    p.circle_stroke(at, 5.0, line);
+                    p.circle_filled(at, 1.6, t::TEXT_HI);
+                }
+                Link::Slider { angle } => {
+                    // Rail en pointillés le long de l'axe, terminé par deux butées.
+                    let reach = DVec2::from_angle(angle) * (1.6 * o.shape.bounding_radius() + 24.0 * view.scale);
+                    let (a, b) = (view.to_screen(center - reach), view.to_screen(center + reach));
+                    p.line_segment([a, b], halo);
+                    p.add(egui::Shape::dashed_line(&[a, b], line, 5.0, 4.0));
+                    let across = (b - a).normalized().rot90() * 5.0;
+                    for end in [a, b] {
+                        p.line_segment([end - across, end + across], halo);
+                        p.line_segment([end - across, end + across], line);
+                    }
+                }
+                Link::Spring { anchor, .. } => {
+                    // Ressort en zigzag entre l'ancrage et le centre de l'objet.
+                    let (a, b) = (view.to_screen(anchor), view.to_screen(center));
+                    let across = (b - a).normalized().rot90() * 5.0;
+                    let mut points = vec![a];
+                    for k in 1..=12 {
+                        let side = if k % 2 == 0 { 1.0 } else { -1.0 };
+                        points.push(a + (b - a) * ((k as f32 + 1.0) / 15.0) + across * side);
+                    }
+                    points.push(b);
+                    p.add(egui::Shape::line(points.clone(), halo));
+                    p.add(egui::Shape::line(points, line));
+                    p.circle_filled(b, 2.5, t::TEXT_HI);
+                    anchor_mark(a);
+                }
+            }
         }
     }
 
@@ -755,6 +796,30 @@ impl App {
         if let Some(i) = toggled {
             let flag = self.modes().into_iter().nth(i).unwrap().1;
             *flag = !*flag;
+        }
+
+        // Contexte mécanique, attaché en haut à droite : vue et pesanteur. Un clic change de vue.
+        let side = self.scene.mechanics.view == MechView::Side;
+        let label = if side {
+            format!("{} · g {} m/s²", tr("VUE DE CÔTÉ"), fr(self.scene.mechanics.gravity, 2))
+        } else {
+            tr("VUE DE DESSUS · TABLE").to_owned()
+        };
+        let width = ui::text_width(p, &label, mono_bold(10.5)) + 1.26 * label.chars().count() as f32 + 24.0;
+        let context = Rect::from_min_size(pos2(plot.right() - width, plot.top()), vec2(width, 32.0));
+        let resp = ui
+            .interact(context, ui.id().with("mech-view"), Sense::click())
+            .on_hover_text(tr("Changer de vue : dessus (table) ou côté (pesanteur dans le plan)"));
+        p.rect_filled(context, 0.0, t::overlay());
+        if resp.hovered() {
+            p.rect_filled(context, 0.0, t::tint());
+        }
+        p.hline(context.x_range(), context.bottom() - 0.5, line);
+        p.vline(context.left() + 0.5, context.y_range(), line);
+        let color = if resp.hovered() { t::TEXT_HI } else { t::LABEL };
+        ui::tracked(p, pos2(context.left() + 12.0, context.center().y), Align2::LEFT_CENTER, &label, mono_bold(10.5), color);
+        if resp.clicked() {
+            self.scene.mechanics.view = if side { MechView::Top } else { MechView::Side };
         }
 
         // Échelle graphique.

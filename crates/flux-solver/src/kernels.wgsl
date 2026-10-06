@@ -74,6 +74,54 @@ fn k_stencil(@builtin(global_invocation_id) id: vec3<u32>) {
     c[idx] = val;
 }
 
+// Terme tangent de Newton des cellules saturables : c ±= Σ κ·g·(g·a)/(g·g), où g = K⁰·b et
+// b est le potentiel de linéarisation. `nu` reçoit ici κ par cellule.
+// mode 0 : c += ; mode 1 : c −=.
+@compute @workgroup_size(16, 16)
+fn k_tangent(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = P.n;
+    let m = n + 1u;
+    if (id.x >= m || id.y >= m) {
+        return;
+    }
+    var sum = 0.0;
+    for (var q = 0u; q < 4u; q++) {
+        let ox = q & 1u;
+        let oy = q >> 1u;
+        if ((ox == 0u && id.x == 0u) || (ox == 1u && id.x == n) || (oy == 0u && id.y == 0u) || (oy == 1u && id.y == n)) {
+            continue;
+        }
+        let ci = id.x + ox - 1u;
+        let cj = id.y + oy - 1u;
+        let kappa = nu[cj * n + ci];
+        if (kappa == 0.0) {
+            continue;
+        }
+        let k = cj * m + ci;
+        let l = vec4<f32>(b[k], b[k + 1u], b[k + m], b[k + m + 1u]);
+        let v = vec4<f32>(a[k], a[k + 1u], a[k + m], a[k + m + 1u]);
+        let g = vec4<f32>(
+            4.0 * l.x - l.y - l.z - 2.0 * l.w,
+            4.0 * l.y - l.x - l.w - 2.0 * l.z,
+            4.0 * l.z - l.x - l.w - 2.0 * l.y,
+            4.0 * l.w - l.y - l.z - 2.0 * l.x,
+        ) / 6.0;
+        let gg = dot(g, g);
+        if (gg <= 0.0) {
+            continue;
+        }
+        // Indice de ce nœud dans la cellule : (1 − ox) + 2·(1 − oy).
+        let local = (1u - ox) + 2u * (1u - oy);
+        sum += kappa * g[local] * dot(g, v) / gg;
+    }
+    let idx = id.y * m + id.x;
+    if (P.mode == 0u) {
+        c[idx] += sum;
+    } else {
+        c[idx] -= sum;
+    }
+}
+
 // c (grille de P.n cellules) = Pᵀ·a (grille deux fois plus fine).
 @compute @workgroup_size(16, 16)
 fn k_restrict(@builtin(global_invocation_id) id: vec3<u32>) {

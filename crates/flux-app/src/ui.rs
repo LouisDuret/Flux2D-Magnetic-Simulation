@@ -462,6 +462,27 @@ pub fn slider(ui: &mut Ui, label: &str, label_width: f32, v: &mut f64, range: Ra
     p.rect_filled(knob, 0.0, if enabled { t::TEXT_HI } else { dim(t::LABEL) });
 }
 
+/// Jauge : piste d'un pixel remplie jusqu'à `ratio / full`, avec un repère au seuil `ratio` = 1.
+/// Au-delà du seuil, le remplissage passe au dégradé d'accent et la valeur prend la couleur `over`.
+pub fn gauge(ui: &mut Ui, label: &str, ratio: f64, full: f64, value: &str, over: Color32) {
+    let r = row(ui, 46.0, t::LINE_SOFT);
+    let p = ui.painter().clone();
+    let past = ratio >= 1.0;
+    p.text(pos2(r.left() + PAD, r.top() + 16.0), Align2::LEFT_CENTER, tr(label), sans(12.0), t::LABEL);
+    p.text(pos2(r.right() - PAD, r.top() + 16.0), Align2::RIGHT_CENTER, value, mono(12.0), if past { over } else { t::TEXT_HI });
+    let track = Rect::from_min_max(pos2(r.left() + PAD, r.bottom() - 13.0), pos2(r.right() - PAD, r.bottom() - 11.0));
+    p.rect_filled(track, 0.0, t::LINE_CTRL);
+    let x = track.left() + track.width() * (ratio / full).clamp(0.0, 1.0) as f32;
+    let filled = Rect::from_min_max(track.min, pos2(x, track.bottom()));
+    if past {
+        grad_h(&p, filled);
+    } else {
+        p.rect_filled(filled, 0.0, t::FORCE);
+    }
+    let mark = track.left() + track.width() * (1.0 / full) as f32;
+    p.vline(mark, track.top() - 4.0..=track.bottom() + 4.0, Stroke::new(1.0, t::TEXT_HI));
+}
+
 /// Interrupteur rectangulaire.
 pub fn switch(ui: &mut Ui, label: &str, on: &mut bool) {
     let r = row(ui, 36.0, t::LINE_SOFT);

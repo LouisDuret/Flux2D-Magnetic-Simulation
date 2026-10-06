@@ -3,6 +3,7 @@
 
 use super::*;
 use eframe::egui::{Event, PointerButton, RawInput, pos2};
+use flux_core::scene::{Body, Link, MechView};
 use flux_core::shape::{BoolOp, Shape};
 use std::f64::consts::FRAC_PI_2;
 
@@ -442,8 +443,31 @@ fn english_interface_is_fully_translated() {
         rig.move_to(rig.at(0.0, 0.0));
         rig.idle(2);
     }
+    // Mécanique : chaque liaison dans l'inspecteur, puis lecture dans les deux vues.
+    let spring = Link::Spring { anchor: DVec2::new(0.02, 0.05), stiffness: 50.0, damping: 0.05, length: 0.03 };
+    for (k, link) in [Link::Free, Link::Pivot { anchor: DVec2::ZERO }, Link::Slider { angle: 0.3 }, spring].into_iter().enumerate() {
+        rig.app.scene.get_mut(2).unwrap().body = Body { mobile: true, mu_s: if k == 0 { 0.0 } else { 0.123 }, mu_k: 0.1, link };
+        rig.app.selected = Some(2);
+        rig.idle(2);
+    }
+    rig.key(Key::Space);
+    rig.idle(3);
+    rig.app.scene.mechanics.view = MechView::Side;
+    rig.idle(2);
+    rig.key(Key::Space);
+    rig.app.selected = None;
+    rig.idle(2);
+    rig.app.rewind();
+    rig.app.scene.get_mut(2).unwrap().body.mobile = false;
+    rig.key(Key::Space);
+    rig.idle(1);
+    rig.app.load(example(3), None);
+    rig.app.selected = Some(2);
+    rig.idle(6);
+    rig.app.load(example(0), None);
+    rig.idle(2);
     rig.app.scene.objects[0].visible = false;
-    rig.app.scene.get_mut(supra).unwrap().temperature = 20.0;
+    let _ = supra;
     rig.app.freeze_reference();
     rig.idle(3);
     rig.app.selected = None;
@@ -470,4 +494,141 @@ fn english_interface_is_fully_translated() {
     assert_eq!(crate::lang::take_missing(), Vec::<String>::new());
     // En anglais, les nombres prennent un point décimal ; en CGS, l'induction est en gauss.
     assert_eq!((crate::ui::fr(1.5, 1), units::b(0.5)), ("1.5".into(), "5.000 kG".into()));
+}
+
+/// Avance jusqu'à ce que le champ soit convergé.
+fn settle(rig: &mut Rig) {
+    for _ in 0..400 {
+        rig.idle(1);
+        if !rig.app.pending {
+            return;
+        }
+    }
+    panic!("le champ ne converge pas");
+}
+
+/// Espace lance la simulation : la plaque glisse vers l'aimant. Pause la fige, « Revenir » la
+/// replace, et l'historique ne garde qu'une entrée pour toute la simulation.
+#[test]
+fn space_plays_and_the_plate_slides_to_the_magnet() {
+    let mut rig = Rig::new(Scene::friction_demo());
+    rig.app.grid_n = 256;
+    settle(&mut rig);
+    let start = rig.app.scene.get(2).unwrap().pos.x;
+    assert!(rig.app.wrenches[1].force.x < 0.0, "la plaque est attirée vers l'aimant");
+    // Au ralenti, pour mettre en pause avant que la plaque n'atteigne l'aimant.
+    rig.app.sim.speed = 0.1;
+    rig.key(Key::Space);
+    assert!(rig.app.sim.playing);
+    rig.idle(8);
+    let x = rig.app.scene.get(2).unwrap().pos.x;
+    assert!(x < start - 2e-4, "la plaque devrait glisser vers l'aimant : {start} → {x}");
+    assert!(rig.app.sim.time() > 0.0 && rig.app.sim.started());
+    assert_eq!(rig.app.undo.len(), 1);
+
+    rig.key(Key::Space);
+    assert!(!rig.app.sim.playing);
+    let paused = rig.app.scene.get(2).unwrap().pos.x;
+    rig.idle(5);
+    assert_eq!(rig.app.scene.get(2).unwrap().pos.x, paused);
+
+    // Un pas à la fois avec la touche point.
+    rig.key(Key::Period);
+    rig.idle(1);
+    assert!(rig.app.scene.get(2).unwrap().pos.x < paused && !rig.app.sim.playing);
+
+    rig.app.rewind();
+    assert_eq!(rig.app.scene.get(2).unwrap().pos.x, start);
+    assert!(!rig.app.sim.started());
+
+    // Laissée assez longtemps, la plaque vient se coller à l'aimant sans le traverser.
+    rig.app.scene.get_mut(2).unwrap().body.mu_k = 0.02;
+    rig.app.sim.speed = 1.0;
+    rig.key(Key::Space);
+    for _ in 0..3000 {
+        rig.idle(1);
+        if rig.app.scene.get(2).unwrap().pos.x < -0.0065 {
+            break;
+        }
+    }
+    rig.idle(30);
+    let x = rig.app.scene.get(2).unwrap().pos.x;
+    // Bord droit de l'aimant en −15 mm, demi-largeur de la plaque 8 mm.
+    assert!((x + 0.007).abs() < 6e-4, "la plaque devrait toucher l'aimant : x = {x}");
+}
+
+/// Critère de sortie de la phase 2 : une bille posée près d'un aimant démarre quand la force
+/// calculée dépasse μs·m·g, à 5 % près.
+#[test]
+fn ball_starts_at_the_computed_threshold() {
+    let mut scene = Scene::default();
+    scene.add("Aimant", Shape::Rect { w: 0.02, h: 0.04 }, DVec2::new(-0.025, 0.0), "NdFeB N42");
+    let ball = scene.add("Bille", Shape::Circle { r: 0.006 }, DVec2::new(0.045, 0.0), "Acier doux (S235)");
+    let mut rig = Rig::new(scene);
+    rig.app.grid_n = 256;
+    settle(&mut rig);
+    let o = rig.app.scene.get(ball).unwrap();
+    let weight = rig.app.scene.material(&o.material).unwrap().density * o.shape.area() * 9.81;
+    let pull = rig.app.wrenches.iter().find(|w| w.id == ball).unwrap().force.length();
+    let critical = pull / weight;
+    println!("F = {pull:.2} N/m, poids = {weight:.2} N/m, μs critique = {critical:.3}");
+    assert!(critical > 0.05 && critical < 2.0);
+
+    for (factor, starts) in [(1.05, false), (0.95, true)] {
+        rig.app.rewind();
+        rig.app.sim.playing = false;
+        rig.app.scene.get_mut(ball).unwrap().body = Body { mobile: true, mu_s: factor * critical, mu_k: 0.5 * critical, link: Link::Free };
+        settle(&mut rig);
+        rig.key(Key::Space);
+        rig.idle(20);
+        let moved = 0.045 - rig.app.scene.get(ball).unwrap().pos.x;
+        assert_eq!(moved > 1e-5, starts, "μs = {factor}·μs critique : déplacement {moved} m");
+        rig.key(Key::Space);
+    }
+}
+
+/// Vue de côté : une bille lâchée tombe sur une plaque fixe et s'y pose.
+#[test]
+fn side_view_ball_falls_onto_a_fixed_plate() {
+    let mut scene = Scene::default();
+    scene.add("Plaque", Shape::Rect { w: 0.08, h: 0.01 }, DVec2::new(0.0, -0.02), "Aluminium");
+    let ball = scene.add("Bille", Shape::Circle { r: 0.005 }, DVec2::new(0.0, 0.02), "Acier doux (S235)");
+    scene.get_mut(ball).unwrap().body.mobile = true;
+    let mut rig = Rig::new(scene);
+    rig.app.grid_n = 256;
+    // La vue se choisit depuis la palette de commandes.
+    rig.open_palette();
+    rig.text("vue de cote");
+    rig.key(Key::Enter);
+    assert_eq!(rig.app.scene.mechanics.view, MechView::Side);
+    settle(&mut rig);
+    rig.key(Key::Space);
+    for _ in 0..600 {
+        rig.idle(1);
+        let world = rig.app.sim.world().unwrap();
+        if rig.app.sim.time() > 0.3 && !world.moving() {
+            break;
+        }
+    }
+    // Dessus de la plaque en −15 mm, rayon de la bille 5 mm.
+    let y = rig.app.scene.get(ball).unwrap().pos.y;
+    assert!((y + 0.010).abs() < 4e-4, "la bille devrait reposer sur la plaque : y = {y}");
+}
+
+/// Une tôle mince devant un aimant puissant sature : Newton itère, et l'inspecteur le montre.
+#[test]
+fn saturated_sheet_converges_in_the_app() {
+    let mut rig = Rig::new(Scene::saturation_demo());
+    rig.app.selected = Some(2);
+    settle(&mut rig);
+    let newton = rig.app.newton.as_ref().unwrap();
+    assert!(newton.raster.nonlinear.is_some() && newton.iterations >= 2, "{}", newton.iterations);
+    let inside = (-30..=30).map(|k| rig.app.solver.field().sample(flux_core::DVec3::new(k as f64 * 1e-3, 0.0, 0.0)).unwrap().b.length());
+    let peak = inside.fold(0.0, f64::max);
+    assert!(peak > 1.5 && peak < 2.5, "induction dans la tôle : {peak} T");
+
+    // Déplacer l'aimant relance le calcul depuis le champ précédent : peu d'itérations suffisent.
+    rig.app.scene.get_mut(1).unwrap().pos.y -= 0.002;
+    settle(&mut rig);
+    assert!(rig.app.newton.as_ref().unwrap().iterations <= 8);
 }

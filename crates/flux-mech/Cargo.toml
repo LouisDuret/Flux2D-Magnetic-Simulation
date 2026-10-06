@@ -1,0 +1,10 @@
+[package]
+name = "flux-mech"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flux-core.workspace = true
+glam.workspace = true
+rapier2d.workspace = true

@@ -66,6 +66,7 @@ fn magnetized_cylinder() {
         t_curie: 0.0,
         t_critical: 0.0,
         density: 7500.0,
+        bh: None,
     });
     scene.add("cyl", Shape::Circle { r: 0.02 }, DVec2::ZERO, "idéal");
     let mut cpu = Cpu64Reference::default();

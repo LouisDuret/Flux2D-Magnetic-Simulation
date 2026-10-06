@@ -4,6 +4,7 @@
 mod canvas;
 mod palette;
 mod panels;
+mod sim;
 #[cfg(test)]
 mod tests;
 
@@ -20,7 +21,7 @@ use flux_core::material::MagClass;
 use flux_core::raster::rasterize;
 use flux_core::scene::Scene;
 use flux_core::shape::{PathNode, Sdf, Shape, flatten_path};
-use flux_solver::{Cpu64Reference, FieldSolver, Planar2DGpu, SolveStatus, Wrench, forces};
+use flux_solver::{Cpu64Reference, FieldSolver, Newton, Planar2DGpu, SolveStatus, Wrench, forces};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -206,7 +207,7 @@ impl Prefs {
 const COLLAPSED: f32 = 28.0;
 
 /// Scènes d'exemple livrées avec l'application.
-const EXAMPLES: [&str; 2] = ["Aimant + plaque de fer", "Supraconducteur et diamagnétique"];
+const EXAMPLES: [&str; 4] = ["Aimant + plaque de fer", "Supraconducteur et diamagnétique", "Plaque attirée sur une table", "Tôle saturée"];
 
 /// Scène vide, nommée dans la langue courante.
 fn blank() -> Scene {
@@ -217,7 +218,12 @@ fn blank() -> Scene {
 
 /// Scène d'exemple, son nom et ceux de ses objets dans la langue courante.
 fn example(index: usize) -> Scene {
-    let mut scene = if index == 0 { Scene::demo() } else { Scene::meissner_demo() };
+    let mut scene = match index {
+        0 => Scene::demo(),
+        1 => Scene::meissner_demo(),
+        2 => Scene::friction_demo(),
+        _ => Scene::saturation_demo(),
+    };
     scene.name = tr(&scene.name).to_owned();
     scene.objects.iter_mut().for_each(|o| o.name = tr_name(&o.name));
     scene
@@ -269,6 +275,10 @@ struct Icons {
     /// Chevrons vers la gauche, la droite, le haut et le bas.
     chevrons: [Icon; 4],
     swap: Icon,
+    play: Icon,
+    pause: Icon,
+    step: Icon,
+    rewind: Icon,
 }
 
 impl Icons {
@@ -294,6 +304,10 @@ impl Icons {
             chevrons: ["M8.5 3.5 5 7l3.5 3.5", "M5.5 3.5 9 7l-3.5 3.5", "M3.5 8.5 7 5l3.5 3.5", "M3.5 5.5 7 9l3.5-3.5"]
                 .map(|d| Icon::parse(14.0, d)),
             swap: Icon::parse(14.0, "M2 4.5h9M8.5 2 11 4.5 8.5 7M12 9.5H3M5.5 7 3 9.5 5.5 12"),
+            play: Icon::parse(16.0, "M5 3v10l8-5z"),
+            pause: Icon::parse(16.0, "M5.5 3v10M10.5 3v10"),
+            step: Icon::parse(16.0, "M4 3v10l7-5zM12.5 3v10"),
+            rewind: Icon::parse(16.0, "M12 3v10L5 8zM3.5 3v10"),
         }
     }
 }
@@ -311,6 +325,9 @@ pub struct App {
 
     render_state: Option<egui_wgpu::RenderState>,
     solver: Box<dyn FieldSolver>,
+    /// Résolution en cours : scène rastérisée et itérations de Newton des matériaux saturables.
+    newton: Option<Newton>,
+    sim: sim::Sim,
     use_gpu: bool,
     grid_n: usize,
     solved_n: usize,
@@ -413,6 +430,8 @@ impl App {
             message: String::new(),
             render_state,
             solver,
+            newton: None,
+            sim: sim::Sim::default(),
             use_gpu,
             grid_n: if use_gpu { 1024 } else { 512 },
             solved_n: 0,
@@ -483,6 +502,7 @@ impl App {
             _ => Box::new(Cpu64Reference::with_tolerance(1e-6)),
         };
         self.use_gpu = gpu && self.render_state.is_some();
+        self.newton = None;
         self.dirty = true;
     }
 
@@ -491,12 +511,17 @@ impl App {
         let dragging = self.edit_open || matches!(self.drag, Some(Drag::Move { .. } | Drag::Rotate { .. } | Drag::Magnetize { .. }));
         // Résolution progressive : le solveur CPU calcule en 256² pendant le geste.
         let n = if dragging && !self.use_gpu { self.grid_n.min(256) } else { self.grid_n };
-        if self.dirty || n != self.solved_n {
-            self.solver.upload(&rasterize(&self.scene, n));
+        if self.dirty || n != self.solved_n || self.newton.is_none() {
+            self.newton = Some(Newton::start(self.solver.as_mut(), rasterize(&self.scene, n)));
             (self.solved_n, self.dirty, self.pending) = (n, false, true);
         }
-        if self.pending {
-            self.status = self.solver.solve(Duration::from_millis(if self.use_gpu { 6 } else { 12 }));
+        // Pendant la lecture, la mécanique a besoin des forces à chaque image.
+        let playing = self.sim.playing;
+        if self.pending
+            && let Some(newton) = &mut self.newton
+        {
+            let budget = if self.use_gpu { 6 } else { 12 } * if playing { 2 } else { 1 };
+            self.status = newton.advance(self.solver.as_mut(), Duration::from_millis(budget));
             self.stats_stale = true;
             self.field_version += 1;
             let field = self.solver.field();
@@ -505,8 +530,10 @@ impl App {
             {
                 r.upload(&rs.device, &rs.queue, field);
             }
-            if self.status.converged {
+            if self.status.converged || playing {
                 self.wrenches = forces(field, &self.scene);
+            }
+            if self.status.converged {
                 self.pending = false;
             } else {
                 ctx.request_repaint();
@@ -537,6 +564,7 @@ impl App {
     }
 
     fn do_undo(&mut self) {
+        self.sim.reset();
         self.skip_history = true;
         if let Some(s) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.scene, s));
@@ -544,6 +572,7 @@ impl App {
     }
 
     fn do_redo(&mut self) {
+        self.sim.reset();
         self.skip_history = true;
         if let Some(s) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.scene, s));
@@ -552,6 +581,7 @@ impl App {
 
     fn load(&mut self, scene: Scene, path: Option<std::path::PathBuf>) {
         (self.scene, self.path, self.selected) = (scene, path, None);
+        self.sim.reset();
         self.draft.clear();
         self.undo.clear();
         self.redo.clear();
@@ -720,6 +750,14 @@ impl App {
         if save {
             self.save(false);
         }
+        let (play, step) =
+            ui.input(|i| (!i.modifiers.any() && i.key_pressed(Key::Space), !i.modifiers.any() && i.key_pressed(Key::Period)));
+        if play {
+            self.toggle_play();
+        }
+        if step {
+            self.step_simulation();
+        }
         ui.input(|i| {
             if i.modifiers.any() {
                 return;
@@ -774,6 +812,9 @@ impl App {
         lang::set(self.prefs.lang);
         units::set(self.prefs.units);
         self.step_solver(&ctx);
+        // La mécanique déplace les objets avant la photo de la scène : ses pas n'entrent pas
+        // un à un dans l'historique.
+        self.simulate(&ctx);
         let before = self.scene.clone();
         self.shortcuts(ui);
         let bare = |fill| egui::Frame::new().fill(fill);

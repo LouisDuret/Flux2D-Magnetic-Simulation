@@ -117,6 +117,98 @@ impl Shape {
     }
 }
 
+/// Découpe la région délimitée par des contours (règle pair-impair) en trapèzes à bases
+/// horizontales : de quoi remplir ou faire entrer en collision n'importe quelle forme,
+/// concave ou trouée.
+pub fn trapezoids(contours: &[Contour]) -> Vec<[DVec2; 4]> {
+    let mut ys: Vec<f64> = contours.iter().flatten().map(|p| p.y).collect();
+    ys.sort_by(f64::total_cmp);
+    ys.dedup();
+    let edges: Vec<(DVec2, DVec2)> =
+        contours.iter().flat_map(|c| (0..c.len()).map(move |i| (c[i], c[(i + 1) % c.len()]))).filter(|(a, b)| a.y != b.y).collect();
+    let mut out = Vec::new();
+    let mut xs: Vec<(f64, f64)> = Vec::new();
+    for band in ys.windows(2) {
+        let (y0, y1) = (band[0], band[1]);
+        let mid = (y0 + y1) / 2.0;
+        // Abscisses, en bas et en haut de la bande, des arêtes qui la traversent.
+        xs.clear();
+        for &(a, b) in &edges {
+            if (a.y > mid) != (b.y > mid) {
+                let x = |y: f64| a.x + (y - a.y) / (b.y - a.y) * (b.x - a.x);
+                xs.push((x(y0), x(y1)));
+            }
+        }
+        xs.sort_by(|p, q| (p.0 + p.1).total_cmp(&(q.0 + q.1)));
+        for pair in xs.as_chunks::<2>().0 {
+            out.push([DVec2::new(pair[0].0, y0), DVec2::new(pair[1].0, y0), DVec2::new(pair[1].1, y1), DVec2::new(pair[0].1, y1)]);
+        }
+    }
+    out
+}
+
+/// Aire, centre de gravité et moment quadratique polaire ∫r² dS autour de ce centre, pour une
+/// région délimitée par des contours (le premier extérieur, les suivants des trous).
+pub fn moments(contours: &[Contour]) -> (f64, DVec2, f64) {
+    let (mut area, mut first, mut polar) = (0.0, DVec2::ZERO, 0.0);
+    for (i, c) in contours.iter().enumerate() {
+        let (mut a, mut m, mut j) = (0.0, DVec2::ZERO, 0.0);
+        for k in 0..c.len() {
+            let (p, q) = (c[k], c[(k + 1) % c.len()]);
+            let cross = p.perp_dot(q);
+            a += cross / 2.0;
+            m += (p + q) * cross / 6.0;
+            j += cross * (p.length_squared() + p.dot(q) + q.length_squared()) / 12.0;
+        }
+        // Un trou se retranche, quel que soit le sens de parcours de son contour.
+        let sign = if i == 0 { a.signum() } else { -a.signum() };
+        area += sign * a;
+        first += m * sign;
+        polar += sign * j;
+    }
+    if area <= 0.0 {
+        return (0.0, DVec2::ZERO, 0.0);
+    }
+    let center = first / area;
+    (area, center, polar - area * center.length_squared())
+}
+
+/// Retire d'un contour fermé les sommets qui s'écartent de moins de `tol` de la ligne de leurs
+/// voisins conservés (Douglas–Peucker).
+pub fn simplify(contour: &[DVec2], tol: f64) -> Contour {
+    fn reduce(pts: &[DVec2], tol: f64, out: &mut Contour) {
+        let (a, b) = (pts[0], pts[pts.len() - 1]);
+        let e = b - a;
+        let far = (1..pts.len() - 1)
+            .map(|k| {
+                let w = pts[k] - a;
+                let t = (w.dot(e) / e.length_squared().max(1e-300)).clamp(0.0, 1.0);
+                (k, (w - e * t).length())
+            })
+            .max_by(|p, q| p.1.total_cmp(&q.1));
+        match far {
+            Some((k, d)) if d > tol => {
+                reduce(&pts[..=k], tol, out);
+                reduce(&pts[k..], tol, out);
+            }
+            _ => out.push(a),
+        }
+    }
+    let n = contour.len();
+    if n < 4 {
+        return contour.to_vec();
+    }
+    // Le contour est coupé en deux chaînes entre son premier sommet et le plus éloigné de lui.
+    let far =
+        (1..n).max_by(|&i, &j| (contour[i] - contour[0]).length_squared().total_cmp(&(contour[j] - contour[0]).length_squared())).unwrap();
+    let mut out = Vec::new();
+    reduce(&contour[..=far], tol, &mut out);
+    let mut back: Vec<DVec2> = contour[far..].to_vec();
+    back.push(contour[0]);
+    reduce(&back, tol, &mut out);
+    if out.len() < 3 { contour.to_vec() } else { out }
+}
+
 /// Distance signée à une ellipse de demi-axes `a` et `b` : recherche itérative du point
 /// le plus proche dans le premier quadrant.
 fn ellipse_distance(p: DVec2, a: f64, b: f64) -> f64 {
@@ -321,5 +413,35 @@ mod tests {
         let square = [corner(0.0, 0.0), corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
         assert_eq!(flatten_path(&square, true).len(), 4);
         assert_eq!(flatten_path(&square, false).len(), 4);
+    }
+
+    /// Les trapèzes pavent exactement la région ; les moments suivent les formules connues.
+    #[test]
+    fn trapezoids_and_moments() {
+        let ring = Shape::Ring { r_in: 0.01, r_out: 0.02 };
+        let contours = ring.contours();
+        let tiled: f64 = trapezoids(&contours).iter().map(|t| signed_area(t).abs()).sum();
+        let (area, center, polar) = moments(&contours);
+        assert!((tiled / area - 1.0).abs() < 1e-9 && (area / ring.area() - 1.0).abs() < 2e-3);
+        assert!(center.length() < 1e-12);
+        // Anneau : J = S·(r1² + r2²)/2.
+        assert!((polar / (area * (0.01f64.powi(2) + 0.02f64.powi(2)) / 2.0) - 1.0).abs() < 2e-3);
+
+        // Rectangle décentré : le centre est retrouvé, J = S·(w² + h²)/12.
+        let rect: Contour = [(0.01, 0.02), (0.05, 0.02), (0.05, 0.04), (0.01, 0.04)].map(|(x, y)| DVec2::new(x, y)).to_vec();
+        let (area, center, polar) = moments(&[rect]);
+        assert!((area - 8e-4).abs() < 1e-15 && (center - DVec2::new(0.03, 0.03)).length() < 1e-12);
+        assert!((polar / (8e-4 * (0.04f64.powi(2) + 0.02f64.powi(2)) / 12.0) - 1.0).abs() < 1e-9);
+    }
+
+    /// La simplification garde la forme à la tolérance près et retire les sommets superflus.
+    #[test]
+    fn simplify_keeps_the_outline() {
+        let circle = Shape::Circle { r: 0.02 }.contours().remove(0);
+        let coarse = simplify(&circle, 2e-4);
+        assert!(coarse.len() < 40 && coarse.len() >= 12, "{}", coarse.len());
+        assert!((signed_area(&coarse).abs() / signed_area(&circle).abs() - 1.0).abs() < 0.02);
+        let square = Shape::Rect { w: 0.02, h: 0.01 }.contours().remove(0);
+        assert_eq!(simplify(&square, 1e-5), square);
     }
 }

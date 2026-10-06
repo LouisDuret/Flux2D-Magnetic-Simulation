@@ -1,7 +1,7 @@
 //! Solveur de référence CPU en double précision.
 
 use crate::{COARSE_SWEEPS, Field, FieldSolver, MAX_ITERATIONS, OMEGA, SMOOTH_SWEEPS, SolveStatus, nu_hierarchy};
-use flux_core::raster::RasterizedScene;
+use flux_core::raster::{RasterizedScene, element, element_nodes};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ fn robin(n: usize, i: usize, j: usize) -> f64 {
 
 /// Stencil Q1 à 9 points calculé à la volée : renvoie ((A·v)(i,j), diagonale).
 #[inline]
-fn stencil(n: usize, nu: &[f64], v: &[f64], i: usize, j: usize) -> (f64, f64) {
+pub(crate) fn stencil(n: usize, nu: &[f64], v: &[f64], i: usize, j: usize) -> (f64, f64) {
     let m = n + 1;
     let vc = v[j * m + i];
     let (mut av, mut diag) = (0.0, 0.0);
@@ -49,6 +49,23 @@ fn map_stencil(n: usize, nu: &[f64], v: &[f64], out: &mut [f64], f: impl Fn(f64,
             *o = f(av, diag, j * m + i);
         }
     });
+}
+
+/// Terme tangent de Newton d'une cellule saturable : nœuds, g = K⁰·a et κ/(g·g).
+struct Tangent {
+    nodes: [usize; 4],
+    g: [f64; 4],
+    scale: f64,
+}
+
+/// out += signe·Σ κ·g·(g·v)/(g·g) : partie de la jacobienne ajoutée à l'opérateur sécant.
+fn tangent_add(tangents: &[Tangent], v: &[f64], out: &mut [f64], sign: f64) {
+    for t in tangents {
+        let gv: f64 = (0..4).map(|i| t.g[i] * v[t.nodes[i]]).sum();
+        for i in 0..4 {
+            out[t.nodes[i]] += sign * t.scale * gv * t.g[i];
+        }
+    }
 }
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
@@ -125,6 +142,7 @@ pub struct Cpu64Reference {
     /// Résidu relatif cible.
     pub tol: f64,
     levels: Vec<Level>,
+    tangents: Vec<Tangent>,
     x: Vec<f64>,
     b: Vec<f64>,
     r: Vec<f64>,
@@ -143,6 +161,7 @@ impl Default for Cpu64Reference {
         Cpu64Reference {
             tol: 1e-8,
             levels: Vec::new(),
+            tangents: Vec::new(),
             x: Vec::new(),
             b: Vec::new(),
             r: Vec::new(),
@@ -185,6 +204,16 @@ impl FieldSolver for Cpu64Reference {
                 Level { n, nu, x: z.clone(), b: z.clone(), r: z.clone(), t: z }
             })
             .collect();
+        self.tangents.clear();
+        if let Some(nl) = &scene.nonlinear {
+            for c in &nl.cells {
+                let (_, g) = element(&nl.lin_a, scene.n, c.cell as usize);
+                let (kappa, gg) = (nl.kappa[c.cell as usize] as f64, g.iter().map(|x| x * x).sum::<f64>());
+                if kappa != 0.0 && gg > 0.0 {
+                    self.tangents.push(Tangent { nodes: element_nodes(scene.n, c.cell as usize), g, scale: kappa / gg });
+                }
+            }
+        }
         self.b = scene.rhs();
         self.b_norm = dot(&self.b, &self.b).sqrt();
         self.iterations = 0;
@@ -203,6 +232,7 @@ impl FieldSolver for Cpu64Reference {
         } else if self.fresh {
             let b = &self.b;
             map_stencil(n, &self.levels[0].nu, &self.x, &mut self.r, |av, _, k| b[k] - av);
+            tangent_add(&self.tangents, &self.x, &mut self.r, -1.0);
             self.residual = dot(&self.r, &self.r).sqrt() / self.b_norm;
         }
         let mut first = std::mem::take(&mut self.fresh);
@@ -216,6 +246,7 @@ impl FieldSolver for Cpu64Reference {
             self.rz = rz;
             self.p.par_iter_mut().zip(z).for_each(|(p, z)| *p = z + beta * *p);
             map_stencil(n, &self.levels[0].nu, &self.p, &mut self.ap, |av, _, _| av);
+            tangent_add(&self.tangents, &self.p, &mut self.ap, 1.0);
             let alpha = rz / dot(&self.p, &self.ap);
             self.x.par_iter_mut().zip(&self.p).for_each(|(x, p)| *x += alpha * p);
             self.r.par_iter_mut().zip(&self.ap).for_each(|(r, ap)| *r -= alpha * ap);

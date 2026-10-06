@@ -7,9 +7,11 @@ use crate::theme::{self as t, mono, mono_bold, sans, sans_bold};
 use crate::ui::{self, PAD, fr};
 use crate::units::{self, Units};
 use eframe::egui::{self, Align, Align2, Color32, CursorIcon, Layout, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
-use flux_core::ABSOLUTE_ZERO_C;
-use flux_core::material::MagClass;
-use flux_core::shape::{BoolOp, Shape};
+use flux_core::material::{MagClass, NuTable};
+use flux_core::scene::{Link, MechView, Object, SURFACES};
+use flux_core::shape::{BoolOp, Sdf, Shape};
+use flux_core::{ABSOLUTE_ZERO_C, DVec2, DVec3};
+use flux_solver::Field;
 
 /// Prépare un panneau : lignes jointives. Renvoie son rectangle.
 fn begin(ui: &mut Ui) -> Rect {
@@ -21,6 +23,60 @@ fn begin(ui: &mut Ui) -> Rect {
 fn short_name(name: &str) -> String {
     let short = name.split_once('(').and_then(|(_, rest)| rest.split_once(')')).map_or(name, |(inner, _)| inner);
     if short.chars().count() > 12 { short.chars().take(11).chain(['…']).collect() } else { short.to_owned() }
+}
+
+/// Induction moyenne à l'intérieur d'un objet (T), sur une grille de points ; `None` si aucun
+/// point ne tombe dedans.
+fn mean_b(field: &Field, o: &Object) -> Option<f64> {
+    let reach = o.shape.bounding_radius();
+    let (mut sum, mut count) = (0.0, 0);
+    for j in 0..17 {
+        for i in 0..17 {
+            let p = o.pos + DVec3::new(i as f64 / 8.0 - 1.0, j as f64 / 8.0 - 1.0, 0.0) * reach;
+            if o.distance(p) < -field.h()
+                && let Some(s) = field.sample(p)
+            {
+                sum += s.b.length();
+                count += 1;
+            }
+        }
+    }
+    (count > 0).then(|| sum / count as f64)
+}
+
+/// Courbe B(H) d'un matériau saturable, H en échelle logarithmique, avec le point de
+/// fonctionnement de l'objet.
+fn bh_plot(ui: &mut Ui, table: &NuTable, js: f64, at: Option<f64>) {
+    let r = ui::row(ui, 138.0, t::LINE_SOFT);
+    let p = ui.painter().clone();
+    let plot = Rect::from_min_max(pos2(r.left() + PAD, r.top() + 30.0), pos2(r.right() - PAD, r.bottom() - 24.0));
+    let b_top = 1.12 * js;
+    let (h_lo, h_hi) = (table.h(0.02 * js).max(1e-3), table.h(b_top));
+    let place = |b: f64| {
+        let x = ((table.h(b).max(h_lo) / h_lo).ln() / (h_hi / h_lo).ln()).clamp(0.0, 1.0) as f32;
+        pos2(plot.left() + plot.width() * x, plot.bottom() - plot.height() * (b / b_top).min(1.0) as f32)
+    };
+    ui::tracked(&p, pos2(plot.left(), r.top() + 15.0), Align2::LEFT_CENTER, "B(H)", mono_bold(10.0), t::TEXT_HI);
+    let (top, unit) = units::remanence(b_top);
+    p.text(pos2(plot.right(), r.top() + 15.0), Align2::RIGHT_CENTER, format!("{} {unit}", fr(top, 2)), mono(10.0), t::DIM);
+    p.hline(plot.x_range(), plot.bottom(), Stroke::new(1.0, t::LINE_CTRL));
+    p.vline(plot.left(), plot.y_range(), Stroke::new(1.0, t::LINE_CTRL));
+    // Niveau de la polarisation à saturation.
+    let y = plot.bottom() - plot.height() * (js / b_top) as f32;
+    p.add(egui::Shape::dashed_line(&[pos2(plot.left(), y), pos2(plot.right(), y)], Stroke::new(1.0, t::TICK_MAJOR), 3.0, 3.0));
+    p.text(pos2(plot.right(), y + 9.0), Align2::RIGHT_CENTER, "Js", mono(10.0), t::FAINT);
+    let curve: Vec<egui::Pos2> = (1..=96).map(|k| place(b_top * k as f64 / 96.0)).collect();
+    p.add(egui::Shape::line(curve, Stroke::new(1.5, t::ACCENT)));
+    if let Some(b) = at {
+        let mark = Rect::from_center_size(place(b.min(b_top)), Vec2::splat(7.0));
+        p.rect_filled(mark, 0.0, t::BG);
+        p.rect_stroke(mark, 0.0, Stroke::new(1.5, t::TEXT_HI), egui::StrokeKind::Middle);
+    }
+    let amps =
+        |h: f64| if h >= 1000.0 { format!("{} kA/m", fr(h / 1000.0, 0)) } else { format!("{} A/m", fr(h, if h < 10.0 { 1 } else { 0 })) };
+    p.text(pos2(plot.left(), r.bottom() - 12.0), Align2::LEFT_CENTER, amps(h_lo), mono(10.0), t::DIM);
+    p.text(pos2(plot.center().x, r.bottom() - 12.0), Align2::CENTER_CENTER, "H · log", mono(10.0), t::FAINT);
+    p.text(pos2(plot.right(), r.bottom() - 12.0), Align2::RIGHT_CENTER, amps(h_hi), mono(10.0), t::DIM);
 }
 
 impl App {
@@ -88,8 +144,49 @@ impl App {
             }
         }
 
-        // À droite : langue, unités d'affichage, palette de commandes.
+        // Simulation : lecture ou pause, pas à pas, retour à l'état initial, temps simulé.
         let cy = r.center().y;
+        let (playing, started) = (self.sim.playing, self.sim.started());
+        let controls = [
+            (if playing { &self.icons.pause } else { &self.icons.play }, if playing { "Pause (Espace)" } else { "Lecture (Espace)" }, true),
+            (&self.icons.step, "Avancer d’un pas (.)", true),
+            (&self.icons.rewind, "Revenir à l’état initial", started),
+        ];
+        let mut action = None;
+        for (i, (icon, tip, enabled)) in controls.into_iter().enumerate() {
+            let c = Rect::from_min_size(pos2(x, r.top()), vec2(40.0, r.height() - 1.0));
+            x += 40.0;
+            p.vline(x, r.y_range(), line);
+            let resp = ui.interact(c, ui.id().with(("sim", i)), Sense::click()).on_hover_text(tr(tip));
+            let on = i == 0 && playing;
+            if on || (enabled && resp.hovered()) {
+                p.rect_filled(c, 0.0, t::tint());
+            }
+            if on {
+                ui::grad_h(&p, Rect::from_min_max(pos2(c.left(), c.bottom() - 2.0), c.max));
+            }
+            let color = match (enabled, on) {
+                (false, _) => t::DISABLED,
+                (true, true) => t::ACCENT,
+                (true, false) => t::TEXT_MID,
+            };
+            icon.paint(&p, Rect::from_center_size(c.center(), Vec2::splat(15.0)), 1.4, color);
+            if enabled && resp.clicked() {
+                action = Some(i);
+            }
+        }
+        match action {
+            Some(0) => self.toggle_play(),
+            Some(1) => self.step_simulation(),
+            Some(_) => self.rewind(),
+            None => {}
+        }
+        if started {
+            let clock = format!("t {} s", fr(self.sim.time(), 2));
+            p.text(pos2(x + 12.0, cy), Align2::LEFT_CENTER, clock, mono(11.0), if playing { t::ACCENT_TEXT } else { t::LABEL });
+        }
+
+        // À droite : langue, unités d'affichage, palette de commandes.
         let (_, left) = ui::segmented_box(ui, r.right() - PAD, cy, "lang", &mut self.prefs.lang, &[(Lang::Fr, "FR"), (Lang::En, "EN")]);
         let (_, left) = ui::segmented_box(ui, left - 10.0, cy, "units", &mut self.prefs.units, &[(Units::Si, "SI"), (Units::Cgs, "CGS")]);
         let right = left - PAD;
@@ -409,7 +506,27 @@ impl App {
         self.scene.depth = self.scene.depth.max(1e-4);
         self.scene.size = self.scene.size.clamp(0.01, 10.0);
 
-        ui::section(ui, "02", "CALCUL");
+        ui::section(ui, "02", "MÉCANIQUE");
+        let views = [(MechView::Top, tr("Dessus")), (MechView::Side, tr("Côté"))];
+        ui::segmented(ui, "Vue", "mech-view", &mut self.scene.mechanics.view, &views);
+        ui::kv_edit(ui, "Pesanteur", "m/s²", |ui| ui::number(ui, &mut self.scene.mechanics.gravity, Quantity::Count, 0.01, 2));
+        self.scene.mechanics.gravity = self.scene.mechanics.gravity.clamp(0.0, 100.0);
+        let speeds = [(0.1, format!("×{}", fr(0.1, 1))), (0.25, format!("×{}", fr(0.25, 2))), (1.0, "×1".to_owned())];
+        ui::segmented(ui, "Vitesse", "sim-speed", &mut self.sim.speed, &speeds.each_ref().map(|(v, name)| (*v, name.as_str())));
+        let play = if self.sim.playing { "Pause" } else { "Lecture" };
+        match ui::button_row(ui, "sim", &[(play, true), ("Un pas", true), ("Revenir", self.sim.started())]) {
+            Some(0) => self.toggle_play(),
+            Some(1) => self.step_simulation(),
+            Some(_) => self.rewind(),
+            None => {}
+        }
+        let text = match self.scene.mechanics.view {
+            MechView::Top => "Vue de dessus : les objets mobiles reposent sur une table et ne démarrent que si la force dépasse μs·m·g.",
+            MechView::Side => "Vue de côté : la pesanteur agit vers le bas ; les objets fixes et le bord du domaine servent d’appuis.",
+        };
+        ui::note(ui, tr(text), t::FAINT);
+
+        ui::section(ui, "03", "CALCUL");
         let mut gpu = self.use_gpu;
         if ui::segmented(ui, "Moteur", "engine", &mut gpu, &[(true, "GPU f32"), (false, "CPU f64")]) {
             self.set_solver(gpu);
@@ -420,7 +537,7 @@ impl App {
         ui::slider(ui, "Lignes", 44.0, &mut self.n_lines, 8.0..=160.0, Some(shown), true);
         self.n_lines = self.n_lines.round();
 
-        ui::section(ui, "03", "AFFICHAGE");
+        ui::section(ui, "04", "AFFICHAGE");
         ui::switch(ui, "Animer la LIC", &mut self.lic_animate);
         let clear = [("Effacer les graines", !self.scene.seeds.is_empty()), ("Balayer la limaille", !self.visuals.filings.is_empty())];
         match ui::button_row(ui, "clear", &clear) {
@@ -429,7 +546,7 @@ impl App {
             None => {}
         }
 
-        ui::section(ui, "04", "COMPARAISON");
+        ui::section(ui, "05", "COMPARAISON");
         if ui::accent_button(ui, "Figer l’état actuel comme référence", &self.icons.arrow) {
             self.freeze_reference();
         }
@@ -445,6 +562,9 @@ impl App {
     fn inspect_object(&mut self, ui: &mut Ui, id: u32) {
         let names: Vec<String> = self.scene.materials.iter().map(|m| m.name.clone()).collect();
         let (depth, ambient) = (self.scene.depth, self.scene.ambient);
+        let (view, gravity) = (self.scene.mechanics.view, self.scene.mechanics.gravity);
+        let inside = self.scene.get(id).and_then(|o| mean_b(self.solver.field(), o));
+        let motion = self.sim.world().and_then(|w| w.motion(id));
         let wrench = self.wrenches.iter().find(|w| w.id == id).copied();
         let mat = self.scene.get(id).and_then(|o| self.scene.material(&o.material)).cloned();
         let focus_angle = std::mem::take(&mut self.focus_angle);
@@ -537,7 +657,21 @@ impl App {
                 ui::kv(ui, "Tc", &fr(mat.t_curie, 0), "°C");
             }
             MagClass::Ferro => {
-                ui::kv(ui, "μr (linéaire)", &fr(mat.mu_r_solver(o.temperature), 0), "");
+                match mat.curve_at(o.temperature) {
+                    Some(curve) => {
+                        let (table, js) = (curve.table(), curve.js());
+                        ui::kv(ui, "μr initiale", &fr(curve.mu_r_initial(), 0), "");
+                        let (value, unit) = units::remanence(js);
+                        ui::kv(ui, "Js (saturation)", &fr(value, 2), unit);
+                        if let Some(b) = inside {
+                            ui::kv(ui, "B dans l’objet", &units::b(b), "");
+                            ui::kv(ui, "μr effective", &fr(1.0 / table.eval(b).0, 0), "");
+                            ui::gauge(ui, "Saturation B / Js", b / js, 1.25, &format!("{} %", fr(100.0 * b / js, 0)), t::WARN);
+                        }
+                        bh_plot(ui, &table, js, inside);
+                    }
+                    None => ui::kv(ui, "μr (linéaire)", &fr(mat.mu_r_solver(o.temperature), 0), ""),
+                }
                 ui::kv(ui, "Tc", &fr(mat.t_curie, 0), "°C");
             }
             MagClass::Conductor => {
@@ -582,6 +716,75 @@ impl App {
         }
         let locked = o.locked;
 
+        // Mécanique : fixe ou mobile, frottement, liaison avec le support.
+        ui::section(ui, &next(), "MÉCANIQUE");
+        ui::segmented(ui, "État", "mobile", &mut o.body.mobile, &[(false, tr("Fixe")), (true, tr("Mobile"))]);
+        if o.body.mobile {
+            let preset = SURFACES.iter().find(|s| (s.1, s.2) == (o.body.mu_s, o.body.mu_k)).map_or("Personnalisé", |s| s.0);
+            ui::kv_edit(ui, "Surface", "", |ui| {
+                let shown = egui::RichText::new(tr(preset)).font(mono(11.5)).color(t::TEXT_HI);
+                egui::ComboBox::from_id_salt("surface").width(184.0).selected_text(shown).show_ui(ui, |ui| {
+                    for (name, mu_s, mu_k) in SURFACES {
+                        if ui.selectable_label(name == preset, tr(name)).clicked() {
+                            (o.body.mu_s, o.body.mu_k) = (mu_s, mu_k);
+                        }
+                    }
+                });
+            });
+            ui::kv_edit(ui, "μs (statique)", "", |ui| ui::number(ui, &mut o.body.mu_s, Quantity::Count, 0.005, 3));
+            ui::kv_edit(ui, "μk (dynamique)", "", |ui| ui::number(ui, &mut o.body.mu_k, Quantity::Count, 0.005, 3));
+            o.body.mu_s = o.body.mu_s.clamp(0.0, 5.0);
+            o.body.mu_k = o.body.mu_k.clamp(0.0, 5.0);
+
+            let center = o.pos.truncate();
+            let kinds = [Link::Free, Link::Pivot { anchor: DVec2::ZERO }, Link::Slider { angle: 0.0 }];
+            let spring = Link::Spring { anchor: center + DVec2::new(0.0, 0.03), stiffness: 50.0, damping: 0.05, length: 0.03 };
+            let name = |link: &Link| match link {
+                Link::Free => "Libre",
+                Link::Pivot { .. } => "Pivot",
+                Link::Slider { .. } => "Glissière",
+                Link::Spring { .. } => "Ressort",
+            };
+            ui::kv_edit(ui, "Liaison", "", |ui| {
+                let shown = egui::RichText::new(tr(name(&o.body.link))).font(mono(11.5)).color(t::TEXT_HI);
+                egui::ComboBox::from_id_salt("link").width(184.0).selected_text(shown).show_ui(ui, |ui| {
+                    for kind in kinds.into_iter().chain([spring]) {
+                        let on = std::mem::discriminant(&kind) == std::mem::discriminant(&o.body.link);
+                        if ui.selectable_label(on, tr(name(&kind))).clicked() && !on {
+                            o.body.link = kind;
+                        }
+                    }
+                });
+            });
+            let length = |ui: &mut Ui, label: &str, v: &mut f64| {
+                ui::kv_edit(ui, label, "mm", |ui| ui::number(ui, v, Quantity::Length, 0.1, 1));
+            };
+            match &mut o.body.link {
+                Link::Free => {}
+                Link::Pivot { anchor } => {
+                    length(ui, "Pivot X (local)", &mut anchor.x);
+                    length(ui, "Pivot Y (local)", &mut anchor.y);
+                }
+                Link::Slider { angle } => {
+                    ui::kv_edit(ui, "Axe", "°", |ui| ui::number(ui, angle, Quantity::Angle, 1.0, 0));
+                }
+                Link::Spring { anchor, stiffness, damping, length: rest } => {
+                    length(ui, "Ancrage X", &mut anchor.x);
+                    length(ui, "Ancrage Y", &mut anchor.y);
+                    ui::kv_edit(ui, "Raideur", "N/m", |ui| ui::number(ui, stiffness, Quantity::Count, 1.0, 1));
+                    ui::kv_edit(ui, "Amortissement", "N·s/m", |ui| ui::number(ui, damping, Quantity::Count, 0.01, 3));
+                    length(ui, "Longueur au repos", rest);
+                    (*stiffness, *damping, *rest) = (stiffness.max(0.0), damping.max(0.0), rest.max(0.0));
+                }
+            }
+            if let Some(m) = motion {
+                ui::kv(ui, "Vitesse", &fr(m.velocity.length() * 1e3, 1), "mm/s");
+                let state = if m.sliding { "en mouvement" } else { "immobile" };
+                ui::kv_colored(ui, "Mouvement", tr(state), "", if m.sliding { t::ACCENT_TEXT } else { t::TEXT_HI });
+            }
+        }
+        let body = o.body;
+
         if let Some(w) = wrench {
             ui::section(ui, &next(), "FORCE");
             let f = w.force.truncate();
@@ -595,7 +798,23 @@ impl App {
             ui::kv(ui, "|F| réelle", &value, unit);
             let (value, unit) = units::torque_per_length(w.torque);
             ui::kv(ui, "Couple", &value, unit);
-            ui::kv(ui, "F / (m·g)", &units::number(f.length() / (mat.density * area * 9.81)), "");
+            let weight = mat.density * area * gravity;
+            if weight > 0.0 {
+                ui::kv(ui, "F / (m·g)", &units::number(f.length() / weight), "");
+            }
+            // Jauge de glissement : sur la table, l'objet démarre quand F dépasse μs·m·g.
+            if body.mobile && view == MechView::Top && weight > 0.0 && !matches!(body.link, Link::Pivot { .. }) {
+                let pull = match body.link {
+                    Link::Slider { angle } => f.dot(DVec2::from_angle(angle)).abs(),
+                    _ => f.length(),
+                };
+                if body.mu_s > 0.0 {
+                    let ratio = pull / (body.mu_s * weight);
+                    ui::gauge(ui, "Glissement F / (μs·m·g)", ratio, 2.0, &units::number(ratio), t::ACCENT_TEXT);
+                } else {
+                    ui::note(ui, tr("Sans frottement statique : la moindre force met l’objet en mouvement."), t::FAINT);
+                }
+            }
             if w.resolution_limited {
                 ui::note(ui, tr("Entrefer plus fin que la grille : valeur limitée par la résolution."), t::WARN);
             }
@@ -704,6 +923,9 @@ impl App {
         segment(format!("{}²", self.solved_n), t::LABEL);
         segment(format!("{} {}", s.iterations, tr("it.")), t::LABEL);
         segment(format!("{} {:.1e}", tr("résidu"), s.residual), t::LABEL);
+        if let Some(newton) = self.newton.as_ref().filter(|n| n.raster.nonlinear.is_some()) {
+            segment(format!("Newton {}", newton.iterations), t::LABEL);
+        }
         segment(format!("{:.1} ms", s.elapsed.as_secs_f64() * 1e3), t::LABEL);
         if let Some(c) = self.cursor {
             segment(format!("x {} · y {} mm", fr(c.x * 1e3, 1), fr(c.y * 1e3, 1)), t::LABEL);
@@ -711,6 +933,9 @@ impl App {
                 segment(format!("|B| {}", units::b(f.b.length())), t::TEXT_HI);
                 segment(format!("Bx {} · By {}", units::b(f.b.x), units::b(f.b.y)), t::LABEL);
             }
+        }
+        if self.sim.playing {
+            segment(format!("{} ×{}", tr("LECTURE"), fr(self.sim.rate, 2)), t::ACCENT_TEXT);
         }
         if !self.message.is_empty() {
             segment(self.message.clone(), t::WARN);

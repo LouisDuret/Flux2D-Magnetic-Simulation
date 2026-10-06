@@ -5,7 +5,7 @@
 //! et les coefficients alpha/beta restent sur le GPU ; seuls le résidu et, en fin
 //! de calcul, le potentiel remontent vers le CPU.
 
-use crate::{COARSE_SWEEPS, Field, FieldSolver, MAX_ITERATIONS, OMEGA, SMOOTH_SWEEPS, SolveStatus, nu_hierarchy};
+use crate::{COARSE_SWEEPS, Field, FieldSolver, MAX_ITERATIONS, OMEGA, SMOOTH_SWEEPS, SolveStatus, coarse_levels, nu_hierarchy};
 use flux_core::raster::RasterizedScene;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
@@ -19,7 +19,8 @@ const K_PROLONG: usize = 2;
 const K_AXPY: usize = 3;
 const K_DOT_ROWS: usize = 4;
 const K_DOT_FINAL: usize = 5;
-const ENTRY_POINTS: [&str; 6] = ["k_stencil", "k_restrict", "k_prolong", "k_axpy", "k_dot_rows", "k_dot_final"];
+const K_TANGENT: usize = 6;
+const ENTRY_POINTS: [&str; 7] = ["k_stencil", "k_restrict", "k_prolong", "k_axpy", "k_dot_rows", "k_dot_final", "k_tangent"];
 
 /// Itérations de gradient conjugué par soumission.
 const BATCH: u32 = 2;
@@ -56,6 +57,11 @@ struct Grid {
     levels: Vec<Level>,
     x: wgpu::Buffer,
     b: wgpu::Buffer,
+    /// Terme tangent de Newton : κ par cellule et potentiel de linéarisation.
+    kappa: wgpu::Buffer,
+    lin: wgpu::Buffer,
+    /// `kappa` contient des valeurs non nulles.
+    tangent: bool,
     scalars: wgpu::Buffer,
     read_x: wgpu::Buffer,
     read_scalars: wgpu::Buffer,
@@ -223,7 +229,8 @@ impl Planar2DGpu {
             })
             .collect();
         let buf = || storage_buffer(&self.device, nodes);
-        let (x, b, p, ap) = (buf(), buf(), buf(), buf());
+        let (x, b, p, ap, lin) = (buf(), buf(), buf(), buf(), buf());
+        let kappa = storage_buffer(&self.device, n * n);
         let scalars = storage_buffer(&self.device, 8);
         let staging = |len: usize| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -238,6 +245,7 @@ impl Planar2DGpu {
 
         let mut init = Builder { gpu: self, scalars: &scalars, steps: Vec::new() };
         init.push(K_STENCIL, n, 0, &l0.nu, &x, &b, r);
+        init.push(K_TANGENT, n, 1, &kappa, &x, &lin, r);
         init.dot(l0, r, None, 2);
         let init = init.steps;
 
@@ -246,13 +254,14 @@ impl Planar2DGpu {
         it.dot(l0, r, Some(z), 0);
         it.push(K_AXPY, n, 2, &l0.nu, z, d0, &p);
         it.push(K_STENCIL, n, 1, &l0.nu, &p, d0, &ap);
+        it.push(K_TANGENT, n, 0, &kappa, &p, &lin, &ap);
         it.dot(l0, &p, Some(&ap), 1);
         it.push(K_AXPY, n, 0, &l0.nu, &p, d0, &x);
         it.push(K_AXPY, n, 1, &l0.nu, &ap, d0, r);
         it.dot(l0, r, None, 2);
         let iter = it.steps;
 
-        Grid { n, read_x: staging(nodes), read_scalars: staging(8), levels, x, b, scalars, init, iter }
+        Grid { n, read_x: staging(nodes), read_scalars: staging(8), levels, x, b, kappa, lin, tangent: false, scalars, init, iter }
     }
 
     /// Exécute `steps` `repeat` fois et renvoie r·r.
@@ -299,9 +308,22 @@ impl FieldSolver for Planar2DGpu {
             self.field = Field::new(scene.n, scene.size);
         }
         self.field.size = scene.size;
-        let g = self.grid.as_ref().unwrap();
-        for (lv, (_, nu)) in g.levels.iter().zip(nu_hierarchy(scene.n, &scene.nu_r)) {
-            let nu: Vec<f32> = nu.iter().map(|&v| v as f32).collect();
+        let g = self.grid.as_mut().unwrap();
+        match &scene.nonlinear {
+            Some(nl) => {
+                self.queue.write_buffer(&g.kappa, 0, bytemuck::cast_slice(&nl.kappa));
+                self.queue.write_buffer(&g.lin, 0, bytemuck::cast_slice(&nl.lin_a));
+                g.tangent = true;
+            }
+            // Une scène redevenue linéaire efface les termes tangents laissés par la précédente.
+            None if g.tangent => {
+                self.queue.write_buffer(&g.kappa, 0, bytemuck::cast_slice(&vec![0f32; scene.n * scene.n]));
+                g.tangent = false;
+            }
+            None => {}
+        }
+        self.queue.write_buffer(&g.levels[0].nu, 0, bytemuck::cast_slice(&scene.nu_r));
+        for (lv, nu) in g.levels[1..].iter().zip(coarse_levels(scene.n, &scene.nu_r)) {
             self.queue.write_buffer(&lv.nu, 0, bytemuck::cast_slice(&nu));
         }
         let rhs = scene.rhs();

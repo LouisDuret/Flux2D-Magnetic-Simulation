@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 flux-core.workspace = true
 flux-solver.workspace = true
+flux-mech.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 eframe.workspace = true

@@ -23,7 +23,13 @@ fn example_scenes_load() {
 fn write_examples() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     std::fs::create_dir_all(dir).unwrap();
-    for (file, scene) in [("aimant_plaque.flux", Scene::demo()), ("supraconducteur.flux", Scene::meissner_demo())] {
+    let scenes = [
+        ("aimant_plaque.flux", Scene::demo()),
+        ("supraconducteur.flux", Scene::meissner_demo()),
+        ("plaque_sur_table.flux", Scene::friction_demo()),
+        ("tole_saturee.flux", Scene::saturation_demo()),
+    ];
+    for (file, scene) in scenes {
         std::fs::write(format!("{dir}/{file}"), scene.to_ron().unwrap()).unwrap();
     }
 }
